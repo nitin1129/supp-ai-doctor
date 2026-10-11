@@ -115,7 +115,7 @@ REQUIRED_DOCUMENTS = ["registration_certificate", "degree_certificate", "pan_car
 
 
 class DocumentOut(BaseModel):
-    id: int
+    id: str
     kind: str
     filename: str
     content_type: str
@@ -125,7 +125,7 @@ class DocumentOut(BaseModel):
 
 
 class ApplicationOut(BaseModel):
-    id: int
+    id: str
     reference: str | None
     status: str
     current_step: int
@@ -144,7 +144,7 @@ class ApplicationCreated(ApplicationOut):
 
 
 class ApplicationListItem(BaseModel):
-    id: int
+    id: str
     reference: str | None
     status: str
     full_name: str | None
@@ -162,7 +162,7 @@ class AdminApplicationOut(ApplicationOut):
     mobile: str | None
     reviewed_by: str | None
     reviewed_at: datetime | None
-    doctor_id: int | None
+    doctor_id: str | None
 
 
 class NoteIn(BaseModel):
@@ -177,7 +177,7 @@ class AcceptIn(BaseModel):
 
 
 class AcceptOut(BaseModel):
-    doctor_id: int
+    doctor_id: str
     username: str
     email: str
     invite_sent_to: str

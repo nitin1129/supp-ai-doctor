@@ -56,7 +56,7 @@ class LeaveIn(BaseModel):
 
 
 class LeaveOut(BaseModel):
-    id: int
+    id: str
     date: date
     note: str | None
 
@@ -66,7 +66,7 @@ class OutcomeIn(BaseModel):
 
 
 class ProfileOut(BaseModel):
-    id: int
+    id: str
     full_name: str
     email: str
     mobile: str | None
@@ -110,7 +110,7 @@ class Patient(BaseModel):
 
 
 class BookIn(BaseModel):
-    doctor_id: int
+    doctor_id: str
     start_at: datetime = Field(description="Slot start exactly as returned by /doctors/{id}/slots")
     mode: Literal["video", "clinic"]
     patient: Patient
@@ -144,13 +144,13 @@ class ReviewIn(BaseModel):
 
 
 class DoctorBrief(BaseModel):
-    id: int
+    id: str
     full_name: str
     specialties: list[str]
 
 
 class AppointmentOut(BaseModel):
-    id: int
+    id: str
     doctor: DoctorBrief
     patient: dict
     mode: str
@@ -185,7 +185,7 @@ class SlotOut(BaseModel):
 
 
 class DaySlotsOut(BaseModel):
-    doctor_id: int
+    doctor_id: str
     date: date
     day_off: bool
     day_off_note: str | None
@@ -193,7 +193,7 @@ class DaySlotsOut(BaseModel):
 
 
 class DoctorCard(BaseModel):
-    id: int
+    id: str
     full_name: str
     specialties: list[str]
     qualifications: list[str]

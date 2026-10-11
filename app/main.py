@@ -1,7 +1,11 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
 
 from app.config import get_settings
+from app.db import get_db
+from app.models import ensure_indexes
 from app.routers import admin, applications, auth, doctor, members, payments
 from app.services import storage
 
@@ -10,10 +14,18 @@ _DEV_KEY = "Zm9yLWRldi1vbmx5LWNoYW5nZS1tZS0zMi1ieXRlcyE="
 if _s.env == "production" and (_s.jwt_secret == "change-me" or _s.data_encryption_key == _DEV_KEY):
     raise RuntimeError("Set SUPPAI_JWT_SECRET and SUPPAI_DATA_ENCRYPTION_KEY before running in production")
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    ensure_indexes(get_db())  # idempotent; the unique indexes are what prevent double bookings
+    yield
+
+
 app = FastAPI(
     title="SuppAI Doctors API",
-    version="1.0.0",
-    description="Doctor onboarding, doctor dashboard and member consult booking for suppai.in.",
+    version="1.1.0",
+    description="Doctor onboarding, doctor dashboard and member consult booking for suppai.in (MongoDB).",
+    lifespan=lifespan,
 )
 
 for r in (applications.router, admin.router, auth.router, doctor.router, members.router, payments.router):
@@ -22,6 +34,7 @@ for r in (applications.router, admin.router, auth.router, doctor.router, members
 
 @app.get("/health", tags=["Ops"])
 def health() -> dict:
+    get_db().command("ping")
     return {"ok": True}
 
 

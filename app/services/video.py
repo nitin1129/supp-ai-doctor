@@ -10,7 +10,7 @@ import secrets
 from app.config import get_settings
 
 
-def create_room(appointment_id: int) -> str:
+def create_room(appointment_id: str) -> str:
     s = get_settings()
     if s.video_provider == "jitsi":
         return f"{s.jitsi_base_url}/suppai-{appointment_id}-{secrets.token_urlsafe(12)}"

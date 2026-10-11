@@ -1,4 +1,4 @@
-from sqlalchemy import text
+from bson import ObjectId
 
 from tests.conftest import (
     ADMIN,
@@ -47,8 +47,8 @@ def test_validation_rejects_bad_ids(client):
 
 def test_full_aadhaar_and_pan_never_stored_in_plain_text(client, db):
     app_id, tok = _draft(client, full_application())
-    row = db.execute(text("SELECT * FROM doctor_applications WHERE id = :i"), {"i": app_id}).mappings().one()
-    dump = str(dict(row))
+    row = db.doctor_applications.find_one({"_id": ObjectId(app_id)})
+    dump = str(row)
     assert aadhaar() not in dump
     assert "ABCDE1234F" not in dump
     assert "123456789012" not in dump
@@ -103,7 +103,7 @@ def test_admin_list_filter_and_detail(client, db):
     url = detail["documents"][0]["url"]
     assert client.get(url).status_code == 200
     assert client.get(url.replace("sig=", "sig=x")).status_code == 403
-    assert db.execute(text("SELECT count(*) FROM audit_log WHERE action = 'application.viewed'")).scalar() == 1
+    assert db.audit_log.count_documents({"action": "application.viewed"}) == 1
 
 
 def test_hold_then_resubmit_keeps_reference(client, db):
@@ -119,7 +119,7 @@ def test_hold_then_resubmit_keeps_reference(client, db):
     assert client.patch(f"/doctors/applications/{app_id}", headers=tok, json={"step": 6}).status_code == 200
     r = client.post(f"/doctors/applications/{app_id}/submit", headers=tok)
     assert r.json()["status"] == "submitted" and r.json()["reference"] == "SA-DOC-3301"
-    emails = db.execute(text("SELECT template FROM outbox ORDER BY id")).scalars().all()
+    emails = [r["template"] for r in db.outbox.find().sort("_id", 1)]
     assert emails == ["application_received", "application_on_hold", "application_received"]
 
 
@@ -136,14 +136,14 @@ def test_accept_creates_login_and_emails_link_not_password(client, db):
     body = r.json()
     assert body["username"] == "dr.leela.menon"
     assert "password" not in str(body).lower()
-    user = db.execute(text("SELECT * FROM doctor_users")).mappings().one()
+    user = db.doctor_users.find_one()
     assert user["password_hash"] is None
-    invite = db.execute(text("SELECT payload FROM outbox WHERE template = 'doctor_invite'")).scalar_one()
+    invite = db.outbox.find_one({"template": "doctor_invite"})["payload"]
     assert "/doctor/set-password?token=" in invite["link"]
     # Accepting twice is refused
     assert client.post(f"/admin/doctors/applications/{app_id}/accept", headers=ADMIN,
                        json={"registration_verified": True}).status_code == 409
-    assert db.execute(text("SELECT count(*) FROM audit_log WHERE action = 'application.accepted'")).scalar() == 1
+    assert db.audit_log.count_documents({"action": "application.accepted"}) == 1
 
 
 def test_same_name_gets_numbered_username(client, db):
@@ -200,7 +200,7 @@ def test_forgot_password_does_not_reveal_accounts(client, db):
 
 def test_doctor_token_cannot_be_forged_for_another_doctor(client, db):
     a = onboard_doctor(client, db)
-    forged = bearer("doctor", "1", doctor_id=999, ver=1)
+    forged = bearer("doctor", str(ObjectId()), doctor_id=a["doctor_id"], ver=1)
     assert client.get("/doctor/me", headers=forged).status_code == 401
     assert client.get("/doctor/me", headers=a["headers"]).json()["id"] == a["doctor_id"]
     assert client.get("/doctor/me", headers=MEMBER).status_code == 403

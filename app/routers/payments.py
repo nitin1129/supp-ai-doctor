@@ -3,10 +3,10 @@ import json
 import logging
 
 from fastapi import APIRouter, Header, HTTPException, Request
-from sqlalchemy import select
+from pymongo.errors import DuplicateKeyError
 
+from app.db import now
 from app.deps import DB
-from app.models import Appointment, PaymentWebhookEvent
 from app.services import appointments as appt_svc
 from app.services.payments import verify_webhook_signature
 
@@ -29,7 +29,7 @@ async def razorpay_webhook(
     event = payload.get("event", "")
     event_id = x_razorpay_event_id or hashlib.sha256(body).hexdigest()
 
-    if db.scalar(select(PaymentWebhookEvent.id).where(PaymentWebhookEvent.provider_event_id == event_id)):
+    if db.payment_webhook_events.find_one({"provider_event_id": event_id}, {"_id": 1}):
         return {"ok": True, "duplicate": True}
 
     entity = payload.get("payload", {})
@@ -39,12 +39,16 @@ async def razorpay_webhook(
             appt_svc.mark_paid(db, order_id=pay["order_id"], payment_id=pay["id"], amount_paise=int(pay["amount"]))
     elif event in ("refund.processed", "refund.failed"):
         ref = entity.get("refund", {}).get("entity", {})
-        appt = db.scalar(select(Appointment).where(Appointment.razorpay_payment_id == ref.get("payment_id")))
-        if appt is not None:
-            appt.refund_status = "processed" if event == "refund.processed" else "failed"
+        db.appointments.update_one(
+            {"razorpay_payment_id": ref.get("payment_id")},
+            {"$set": {"refund_status": "processed" if event == "refund.processed" else "failed"}},
+        )
     else:
         log.info("Ignoring Razorpay event %s", event)
 
-    db.add(PaymentWebhookEvent(provider_event_id=event_id, event=event, payload=payload))
-    db.commit()
+    try:
+        db.payment_webhook_events.insert_one(
+            {"provider_event_id": event_id, "event": event, "payload": payload, "received_at": now()})
+    except DuplicateKeyError:
+        pass  # processed concurrently; the handlers above are idempotent
     return {"ok": True}

@@ -1,19 +1,14 @@
 import re
 import unicodedata
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from fastapi import HTTPException
-from sqlalchemy import func, select, text
-from sqlalchemy.orm import Session
+from pymongo.database import Database
+from pymongo.errors import DuplicateKeyError
 
 from app.config import get_settings
-from app.models import (
-    ApplicationStatus,
-    Doctor,
-    DoctorApplication,
-    DoctorUser,
-    PasswordToken,
-)
+from app.db import next_sequence, now
+from app.models import ApplicationStatus, DoctorStatus
 from app.schemas.applications import (
     REQUIRED_DOCUMENTS,
     AdminApplicationOut,
@@ -25,7 +20,9 @@ from app.security import decrypt, encrypt, hash_token, mask, new_token
 from app.services import storage
 from app.services.outbox import enqueue
 
-EDITABLE = {ApplicationStatus.DRAFT, ApplicationStatus.ON_HOLD}
+EDITABLE = [ApplicationStatus.DRAFT.value, ApplicationStatus.ON_HOLD.value]
+REVIEWABLE = [ApplicationStatus.SUBMITTED.value, ApplicationStatus.UNDER_REVIEW.value]
+REFERENCE_OFFSET = 3300  # first reference is SA-DOC-3301
 
 REQUIRED_FIELDS: dict[str, list[str]] = {
     "personal": ["full_name", "gender", "date_of_birth", "mobile", "email", "languages", "address"],
@@ -41,42 +38,71 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
 }
 
 
-def apply_update(app: DoctorApplication, body: ApplicationUpdate) -> None:
-    if app.status not in EDITABLE:
-        raise HTTPException(409, f"Application is {app.status} and can no longer be edited")
+def new_application(token: str) -> dict:
+    t = now()
+    return {
+        "reference": None,
+        "status": ApplicationStatus.DRAFT.value,
+        "resume_token_hash": hash_token(token),
+        "current_step": 1,
+        "data": {},
+        "documents": [],
+        "full_name": None,
+        "email": None,
+        "mobile": None,
+        "pan_encrypted": None,
+        "aadhaar_last4": None,
+        "bank_account_encrypted": None,
+        "bank_account_last4": None,
+        "review_note": None,
+        "submitted_at": None,
+        "reviewed_at": None,
+        "reviewed_by": None,
+        "doctor_id": None,
+        "created_at": t,
+        "updated_at": t,
+    }
 
-    data = dict(app.data or {})
+
+def apply_update(app: dict, body: ApplicationUpdate) -> dict:
+    """Applies the update to `app` in place and returns the fields to $set."""
+    if app["status"] not in EDITABLE:
+        raise HTTPException(409, f"Application is {app['status']} and can no longer be edited")
+    changes: dict = {}
+    data = dict(app.get("data") or {})
     for section in ("personal", "registration", "teleconsult", "compliance"):
         part = getattr(body, section)
         if part is not None:
-            merged = {**data.get(section, {}), **part.model_dump(mode="json", exclude_unset=True)}
-            data[section] = merged
+            data[section] = {**data.get(section, {}), **part.model_dump(mode="json", exclude_unset=True)}
 
     if body.bank is not None:
         bank = body.bank.model_dump(mode="json", exclude_unset=True)
         account = bank.pop("account_number", None)
         if account:
-            app.bank_account_encrypted = encrypt(account)
-            app.bank_account_last4 = account[-4:]
+            changes["bank_account_encrypted"] = encrypt(account)
+            changes["bank_account_last4"] = account[-4:]
         data["bank"] = {**data.get("bank", {}), **bank}
 
     if body.identity is not None:
         if body.identity.pan:
-            app.pan_encrypted = encrypt(body.identity.pan)
+            changes["pan_encrypted"] = encrypt(body.identity.pan)
         if body.identity.aadhaar:
-            app.aadhaar_last4 = body.identity.aadhaar[-4:]
+            changes["aadhaar_last4"] = body.identity.aadhaar[-4:]
 
-    app.data = data
+    changes["data"] = data
     personal = data.get("personal", {})
-    app.full_name = personal.get("full_name", app.full_name)
-    app.email = (personal.get("email") or app.email or "").lower() or None
-    app.mobile = personal.get("mobile", app.mobile)
+    changes["full_name"] = personal.get("full_name", app.get("full_name"))
+    changes["email"] = (personal.get("email") or app.get("email") or "").lower() or None
+    changes["mobile"] = personal.get("mobile", app.get("mobile"))
     if body.step:
-        app.current_step = max(app.current_step, body.step)
+        changes["current_step"] = max(app.get("current_step", 1), body.step)
+    changes["updated_at"] = now()
+    app.update(changes)
+    return changes
 
 
-def missing_items(app: DoctorApplication) -> list[str]:
-    data = app.data or {}
+def missing_items(app: dict) -> list[str]:
+    data = app.get("data") or {}
     missing = []
     for section, fields in REQUIRED_FIELDS.items():
         values = data.get(section, {})
@@ -84,75 +110,70 @@ def missing_items(app: DoctorApplication) -> list[str]:
             v = values.get(f)
             if v in (None, "", []) or (section == "compliance" and v is not True):
                 missing.append(f"{section}.{f}")
-    if not app.pan_encrypted:
+    if not app.get("pan_encrypted"):
         missing.append("identity.pan")
-    if not app.aadhaar_last4:
+    if not app.get("aadhaar_last4"):
         missing.append("identity.aadhaar")
-    if not app.bank_account_encrypted:
+    if not app.get("bank_account_encrypted"):
         missing.append("bank.account_number")
     tele = data.get("teleconsult", {})
     if "clinic" in (tele.get("modes") or []):
         for f in ("clinic_address", "clinic_pincode"):
             if not tele.get(f):
                 missing.append(f"teleconsult.{f}")
-    have = {d.kind for d in app.documents}
+    have = {d["kind"] for d in app.get("documents", [])}
     missing += [f"documents.{k}" for k in REQUIRED_DOCUMENTS if k not in have]
     return missing
 
 
-def _docs(app: DoctorApplication, signed: bool) -> list[DocumentOut]:
-    return [
-        DocumentOut(
-            id=d.id,
-            kind=d.kind,
-            filename=d.filename,
-            content_type=d.content_type,
-            size_bytes=d.size_bytes,
-            uploaded_at=d.uploaded_at,
-            url=storage.signed_url(d.storage_key) if signed else None,
-        )
-        for d in app.documents
-    ]
-
-
-def to_out(app: DoctorApplication) -> ApplicationOut:
-    return ApplicationOut(
-        id=app.id,
-        reference=app.reference,
-        status=app.status,
-        current_step=app.current_step,
-        data=app.data or {},
-        pan_masked=mask(decrypt(app.pan_encrypted)) if app.pan_encrypted else None,
-        aadhaar_masked=f"XXXXXXXX{app.aadhaar_last4}" if app.aadhaar_last4 else None,
-        bank_account_masked=f"XXXX{app.bank_account_last4}" if app.bank_account_last4 else None,
-        review_note=app.review_note if app.status in (ApplicationStatus.ON_HOLD, ApplicationStatus.REJECTED) else None,
-        submitted_at=app.submitted_at,
-        documents=_docs(app, signed=False),
-        missing=missing_items(app) if app.status in EDITABLE else [],
+def document_out(d: dict, signed: bool = False) -> DocumentOut:
+    return DocumentOut(
+        id=str(d["id"]),
+        kind=d["kind"],
+        filename=d["filename"],
+        content_type=d["content_type"],
+        size_bytes=d["size_bytes"],
+        uploaded_at=d["uploaded_at"],
+        url=storage.signed_url(d["storage_key"]) if signed else None,
     )
 
 
-def to_admin_out(app: DoctorApplication) -> AdminApplicationOut:
+def to_out(app: dict) -> ApplicationOut:
+    held = app["status"] in (ApplicationStatus.ON_HOLD, ApplicationStatus.REJECTED)
+    return ApplicationOut(
+        id=str(app["_id"]),
+        reference=app.get("reference"),
+        status=app["status"],
+        current_step=app.get("current_step", 1),
+        data=app.get("data") or {},
+        pan_masked=mask(decrypt(app["pan_encrypted"])) if app.get("pan_encrypted") else None,
+        aadhaar_masked=f"XXXXXXXX{app['aadhaar_last4']}" if app.get("aadhaar_last4") else None,
+        bank_account_masked=f"XXXX{app['bank_account_last4']}" if app.get("bank_account_last4") else None,
+        review_note=app.get("review_note") if held else None,
+        submitted_at=app.get("submitted_at"),
+        documents=[document_out(d) for d in app.get("documents", [])],
+        missing=missing_items(app) if app["status"] in EDITABLE else [],
+    )
+
+
+def to_admin_out(app: dict) -> AdminApplicationOut:
     base = to_out(app).model_dump()
-    base["documents"] = _docs(app, signed=True)
-    base["review_note"] = app.review_note
+    base["documents"] = [document_out(d, signed=True) for d in app.get("documents", [])]
+    base["review_note"] = app.get("review_note")
     return AdminApplicationOut(
         **base,
-        pan=decrypt(app.pan_encrypted) if app.pan_encrypted else None,
-        full_name=app.full_name,
-        email=app.email,
-        mobile=app.mobile,
-        reviewed_by=app.reviewed_by,
-        reviewed_at=app.reviewed_at,
-        doctor_id=app.doctor_id,
+        pan=decrypt(app["pan_encrypted"]) if app.get("pan_encrypted") else None,
+        full_name=app.get("full_name"),
+        email=app.get("email"),
+        mobile=app.get("mobile"),
+        reviewed_by=app.get("reviewed_by"),
+        reviewed_at=app.get("reviewed_at"),
+        doctor_id=str(app["doctor_id"]) if app.get("doctor_id") else None,
     )
 
 
-def assign_reference(db: Session, app: DoctorApplication) -> None:
-    if app.reference:
-        return
-    n = db.execute(text("SELECT nextval('doctor_application_ref_seq')")).scalar_one()
-    app.reference = f"SA-DOC-{n}"
+def reference_for(db: Database, app: dict) -> str:
+    return app.get("reference") or f"SA-DOC-{REFERENCE_OFFSET + next_sequence(db, 'doctor_application_ref')}"
 
 
 # --- Accepting --------------------------------------------------------------
@@ -166,40 +187,36 @@ def username_base(full_name: str) -> str:
     return "dr." + ".".join(parts or ["doctor"])
 
 
-def unique_username(db: Session, full_name: str) -> str:
+def _username_candidates(db: Database, full_name: str):
     base = username_base(full_name)
-    taken = set(
-        db.scalars(
-            select(DoctorUser.username).where(
-                (DoctorUser.username == base) | DoctorUser.username.like(f"{base}%")
-            )
-        )
-    )
+    taken = {u["username"] for u in db.doctor_users.find({"username": {"$regex": f"^{re.escape(base)}\\d*$"}}, {"username": 1})}
     if base not in taken:
-        return base
+        yield base
     n = 2
-    while f"{base}{n}" in taken:
+    while True:
+        if f"{base}{n}" not in taken:
+            yield f"{base}{n}"
         n += 1
-    return f"{base}{n}"
 
 
-def issue_set_password_link(db: Session, user: DoctorUser, template: str) -> datetime:
+def issue_set_password_link(db: Database, user: dict, template: str) -> datetime:
     """Revokes earlier unused links and queues a fresh one-time link by email."""
     s = get_settings()
-    now = datetime.now(UTC)
-    db.query(PasswordToken).filter(
-        PasswordToken.doctor_user_id == user.id, PasswordToken.used_at.is_(None)
-    ).update({PasswordToken.used_at: now})
+    t = now()
+    db.password_tokens.update_many({"doctor_user_id": user["_id"], "used_at": None}, {"$set": {"used_at": t}})
     token = new_token()
-    expires = now + timedelta(hours=s.invite_link_hours)
-    db.add(PasswordToken(doctor_user_id=user.id, token_hash=hash_token(token), expires_at=expires))
+    expires = t + timedelta(hours=s.invite_link_hours)
+    db.password_tokens.insert_one(
+        {"doctor_user_id": user["_id"], "token_hash": hash_token(token), "expires_at": expires, "used_at": None,
+         "created_at": t}
+    )
     enqueue(
         db,
         channel="email",
         template=template,
-        recipient=user.email,
+        recipient=user["email"],
         payload={
-            "username": user.username,
+            "username": user["username"],
             "link": f"{s.public_site_url}/doctor/set-password?token={token}",
             "expires_at": expires.isoformat(),
         },
@@ -207,54 +224,99 @@ def issue_set_password_link(db: Session, user: DoctorUser, template: str) -> dat
     return expires
 
 
-def accept(db: Session, app: DoctorApplication, admin_id: str) -> tuple[Doctor, DoctorUser, datetime]:
-    """Create the doctor, their login and the invite in the caller's transaction."""
+def build_doctor(app: dict) -> dict:
     s = get_settings()
-    if not app.email:
-        raise HTTPException(422, "Application has no email")
-    if db.scalar(select(func.count()).select_from(DoctorUser).where(DoctorUser.email == app.email)):
-        raise HTTPException(409, "A doctor login with this email already exists")
-
-    d = app.data or {}
+    d = app.get("data") or {}
     personal, reg, tele, bank = (d.get(k, {}) for k in ("personal", "registration", "teleconsult", "bank"))
-    now = datetime.now(UTC)
+    t = now()
+    return {
+        "application_id": app["_id"],
+        "status": DoctorStatus.ACTIVE.value,
+        "status_note": None,
+        "full_name": app["full_name"],
+        "gender": personal.get("gender"),
+        "email": app["email"],
+        "mobile": app.get("mobile"),
+        "specialties": reg.get("specialties") or [],
+        "qualifications": reg.get("qualifications") or [],
+        "languages": personal.get("languages") or [],
+        "modes": tele.get("modes") or ["video"],
+        "registration_number": reg.get("registration_number"),
+        "registration_council": tele.get("registration_council"),
+        "registration_verified_at": t,
+        "experience_years": tele.get("experience_years") or 0,
+        "bio": None,
+        "fee_paise": (tele.get("fee_inr") or 0) * 100,
+        "clinic_address": tele.get("clinic_address"),
+        "clinic_pincode": tele.get("clinic_pincode"),
+        "hours": [],
+        "slot_minutes": s.default_slot_minutes,
+        "notice_minutes": s.default_notice_minutes,
+        "rating_sum": 0,
+        "rating_count": 0,
+        "pan_encrypted": app.get("pan_encrypted"),
+        "aadhaar_last4": app.get("aadhaar_last4"),
+        "bank_account_encrypted": app.get("bank_account_encrypted"),
+        "bank_account_last4": app.get("bank_account_last4"),
+        "bank_ifsc": bank.get("ifsc"),
+        "lock_until": None,
+        "lock_token": None,
+        "created_at": t,
+    }
 
-    doctor = Doctor(
-        application_id=app.id,
-        full_name=app.full_name,
-        gender=personal.get("gender"),
-        email=app.email,
-        mobile=app.mobile,
-        specialties=reg.get("specialties") or [],
-        qualifications=reg.get("qualifications") or [],
-        languages=personal.get("languages") or [],
-        modes=tele.get("modes") or ["video"],
-        registration_number=reg.get("registration_number"),
-        registration_council=tele.get("registration_council"),
-        registration_verified_at=now,
-        experience_years=tele.get("experience_years") or 0,
-        fee_paise=(tele.get("fee_inr") or 0) * 100,
-        clinic_address=tele.get("clinic_address"),
-        clinic_pincode=tele.get("clinic_pincode"),
-        slot_minutes=s.default_slot_minutes,
-        notice_minutes=s.default_notice_minutes,
-        pan_encrypted=app.pan_encrypted,
-        aadhaar_last4=app.aadhaar_last4,
-        bank_account_encrypted=app.bank_account_encrypted,
-        bank_account_last4=app.bank_account_last4,
-        bank_ifsc=bank.get("ifsc"),
+
+def accept(db: Database, app_id, admin_id: str) -> tuple[dict, dict, datetime]:
+    """Creates the doctor, their login and the invite.
+
+    The application is claimed first with a conditional update, so two admins
+    can't accept it twice. If a later step fails, earlier ones are undone.
+    """
+    t = now()
+    app = db.doctor_applications.find_one_and_update(
+        {"_id": app_id, "status": {"$in": REVIEWABLE}, "accepting_at": None},
+        {"$set": {"accepting_at": t}},
     )
-    db.add(doctor)
-    db.flush()
+    if app is None:
+        current = db.doctor_applications.find_one({"_id": app_id}, {"status": 1})
+        if current is None:
+            raise HTTPException(404, "Application not found")
+        raise HTTPException(409, f"Application is {current['status']}")
 
-    user = DoctorUser(doctor_id=doctor.id, username=unique_username(db, app.full_name or "doctor"), email=app.email)
-    db.add(user)
-    db.flush()
+    doctor_id = user_id = None
+    try:
+        if not app.get("email"):
+            raise HTTPException(422, "Application has no email")
+        if db.doctor_users.count_documents({"email": app["email"]}, limit=1):
+            raise HTTPException(409, "A doctor login with this email already exists")
 
-    expires = issue_set_password_link(db, user, template="doctor_invite")
+        doctor = build_doctor(app)
+        doctor_id = db.doctors.insert_one(doctor).inserted_id
 
-    app.status = ApplicationStatus.ACCEPTED
-    app.doctor_id = doctor.id
-    app.reviewed_at = now
-    app.reviewed_by = admin_id
-    return doctor, user, expires
+        user = None
+        for username in _username_candidates(db, app["full_name"] or "doctor"):
+            user = {"doctor_id": doctor_id, "username": username, "email": app["email"], "password_hash": None,
+                    "password_set_at": None, "failed_logins": 0, "locked_until": None, "last_login_at": None,
+                    "token_version": 0, "created_at": t}
+            try:
+                user_id = db.doctor_users.insert_one(user).inserted_id
+                break
+            except DuplicateKeyError as e:
+                if "email" in str(e):
+                    raise HTTPException(409, "A doctor login with this email already exists")
+                continue  # someone took this username a moment ago; try the next number
+
+        expires = issue_set_password_link(db, user, template="doctor_invite")
+        db.doctor_applications.update_one(
+            {"_id": app_id},
+            {"$set": {"status": ApplicationStatus.ACCEPTED.value, "doctor_id": doctor_id, "reviewed_at": t,
+                      "reviewed_by": admin_id, "updated_at": t}, "$unset": {"accepting_at": ""}},
+        )
+        return doctor, user, expires
+    except BaseException:
+        if user_id is not None:
+            db.doctor_users.delete_one({"_id": user_id})
+            db.password_tokens.delete_many({"doctor_user_id": user_id})
+        if doctor_id is not None:
+            db.doctors.delete_one({"_id": doctor_id})
+        db.doctor_applications.update_one({"_id": app_id}, {"$unset": {"accepting_at": ""}})
+        raise

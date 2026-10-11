@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import text
+import pytest
+from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from app import worker
 from app.config import get_settings
@@ -22,11 +24,23 @@ def _book(client, doctor_id, start_at, member=MEMBER, mode="video"):
                        json={"doctor_id": doctor_id, "start_at": start_at, "mode": mode, "patient": PATIENT})
 
 
+def _set_start(db, appt_id, delta: timedelta):
+    start = datetime.now(UTC).replace(microsecond=0) + delta
+    db.appointments.update_one({"_id": ObjectId(appt_id)},
+                               {"$set": {"start_at": start, "end_at": start + timedelta(minutes=15)}})
+
+
 def _move_to_past(db, appt_id, minutes_ago=30):
-    db.execute(text("UPDATE appointments SET start_at = now() - make_interval(mins => :m), "
-                    "end_at = now() - make_interval(mins => :m) + interval '15 minutes' WHERE id = :i"),
-               {"m": minutes_ago, "i": appt_id})
-    db.commit()
+    _set_start(db, appt_id, -timedelta(minutes=minutes_ago))
+
+
+def _expire_hold(db, appt_id):
+    db.appointments.update_one({"_id": ObjectId(appt_id)},
+                               {"$set": {"hold_expires_at": datetime.now(UTC) - timedelta(minutes=1)}})
+
+
+def _appt(db, appt_id):
+    return db.appointments.find_one({"_id": ObjectId(appt_id)})
 
 
 # --- Hours and slots ------------------------------------------------------------
@@ -109,7 +123,7 @@ def test_book_pay_and_both_sides_see_it(client, db):
     assert [a["id"] for a in docs] == [b["id"]]
     # Another member can't see it
     assert client.get(f"/appointments/{b['id']}", headers=MEMBER2).status_code == 404
-    templates = set(db.execute(text("SELECT template FROM outbox WHERE appointment_id = :i"), {"i": b["id"]}).scalars())
+    templates = {r["template"] for r in db.outbox.find({"appointment_id": ObjectId(b["id"])})}
     assert {"appointment_booked", "appointment_confirmed", "appointment_reminder",
             "create_video_room", "check_unmarked"} <= templates
 
@@ -122,7 +136,7 @@ def test_webhook_rejects_bad_signature_and_is_idempotent(client, db):
     assert pay(client, b["razorpay_order_id"], 60000, event_id="evt_1").status_code == 200
     assert pay(client, b["razorpay_order_id"], 60000, event_id="evt_1").json()["duplicate"] is True
     assert pay(client, b["razorpay_order_id"], 60000, event_id="evt_2").status_code == 200
-    n = db.execute(text("SELECT count(*) FROM outbox WHERE template = 'appointment_booked'")).scalar()
+    n = db.outbox.count_documents({"template": "appointment_booked"})
     assert n == 1
 
 
@@ -136,39 +150,33 @@ def test_double_booking_is_impossible(client, db):
 def test_unique_index_backstops_the_api(client, db):
     d = onboard_doctor(client, db)
     b = book_and_pay(client, d["doctor_id"])
-    try:
-        db.execute(text("INSERT INTO appointments (doctor_id, member_id, patient, mode, start_at, end_at, status, "
-                        "fee_paise, amount_paid_paise, refund_paise, reschedule_count) "
-                        "SELECT doctor_id, 'x', patient, mode, start_at, end_at, 'booked', 0, 0, 0, 0 "
-                        "FROM appointments WHERE id = :i"), {"i": b["id"]})
-        db.commit()
-        raise AssertionError("duplicate insert should fail")
-    except Exception as e:
-        db.rollback()
-        assert "uq_appointment_doctor_start_active" in str(e)
+    copy = _appt(db, b["id"])
+    copy.pop("_id")
+    copy["member_id"], copy["razorpay_order_id"] = "someone-else", None
+    with pytest.raises(DuplicateKeyError):
+        db.appointments.insert_one(copy)
+    # A cancelled appointment no longer holds the slot
+    copy["holds_slot"], copy["status"] = False, "cancelled"
+    db.appointments.insert_one(copy)
 
 
 def test_expired_hold_frees_slot(client, db):
     d = onboard_doctor(client, db)
     start = first_free_slot(client, d["doctor_id"])
     first = _book(client, d["doctor_id"], start).json()
-    db.execute(text("UPDATE appointments SET hold_expires_at = now() - interval '1 minute' WHERE id = :i"),
-               {"i": first["id"]})
-    db.commit()
+    _expire_hold(db, first["id"])
     second = _book(client, d["doctor_id"], start, member=MEMBER2)
     assert second.status_code == 201
     # The first member's late payment is refunded, not double-booked
     pay(client, first["razorpay_order_id"], 60000)
-    row = db.execute(text("SELECT status, refund_paise, refund_status FROM appointments WHERE id = :i"),
-                     {"i": first["id"]}).one()
-    assert row == ("cancelled", 60000, "pending")
+    row = _appt(db, first["id"])
+    assert (row["status"], row["refund_paise"], row["refund_status"]) == ("cancelled", 60000, "pending")
 
 
 def test_late_payment_still_books_if_slot_is_free(client, db):
     d = onboard_doctor(client, db)
     b = _book(client, d["doctor_id"], first_free_slot(client, d["doctor_id"])).json()
-    db.execute(text("UPDATE appointments SET hold_expires_at = now() - interval '1 minute' WHERE id = :i"), {"i": b["id"]})
-    db.commit()
+    _expire_hold(db, b["id"])
     worker.run_once()  # expires the hold
     pay(client, b["razorpay_order_id"], 60000)
     assert client.get(f"/appointments/{b['id']}", headers=MEMBER).json()["status"] == "booked"
@@ -204,9 +212,7 @@ def test_reschedule_frees_old_slot(client, db):
 def test_reschedule_closed_near_start(client, db):
     d = onboard_doctor(client, db)
     b = book_and_pay(client, d["doctor_id"])
-    db.execute(text("UPDATE appointments SET start_at = now() + interval '3 hours', "
-                    "end_at = now() + interval '3 hours 15 minutes' WHERE id = :i"), {"i": b["id"]})
-    db.commit()
+    _set_start(db, b["id"], timedelta(hours=3))
     r = client.patch(f"/appointments/{b['id']}/reschedule", headers=MEMBER,
                      json={"start_at": first_free_slot(client, d["doctor_id"], index=5)})
     assert r.status_code == 409
@@ -219,9 +225,7 @@ def test_member_cancel_refund_rules(client, db):
     assert r.json()["status"] == "cancelled" and r.json()["refund_inr"] == 600
 
     late = book_and_pay(client, d["doctor_id"], first_free_slot(client, d["doctor_id"], index=4))
-    db.execute(text("UPDATE appointments SET start_at = now() + interval '2 hours', "
-                    "end_at = now() + interval '2 hours 15 minutes' WHERE id = :i"), {"i": late["id"]})
-    db.commit()
+    _set_start(db, late["id"], timedelta(hours=2))
     r = client.post(f"/appointments/{late['id']}/cancel", headers=MEMBER, json={})
     assert r.json()["status"] == "cancelled" and r.json()["refund_inr"] == 0
 
@@ -236,8 +240,8 @@ def test_done_queues_payout_and_review_updates_rating(client, db):
     _move_to_past(db, b["id"])
     r = client.patch(url, headers=d["headers"], json={"status": "completed"})
     assert r.status_code == 200 and r.json()["member_status"] == "completed"
-    payout = db.execute(text("SELECT gross_paise, commission_paise, net_paise FROM payouts")).one()
-    assert payout == (60000, 9000, 51000)
+    p = db.payouts.find_one()
+    assert (p["gross_paise"], p["commission_paise"], p["net_paise"]) == (60000, 9000, 51000)
 
     assert client.post(f"/appointments/{b['id']}/review", headers=MEMBER, json={"rating": 5}).status_code == 201
     assert client.post(f"/appointments/{b['id']}/review", headers=MEMBER, json={"rating": 1}).status_code == 409
@@ -250,7 +254,7 @@ def test_patient_no_show(client, db):
     _move_to_past(db, b["id"])
     r = client.patch(f"/doctor/appointments/{b['id']}/status", headers=d["headers"], json={"status": "no_show"})
     assert r.json()["member_status"] == "no_show" and r.json()["refund_inr"] == 0
-    assert db.execute(text("SELECT net_paise FROM payouts")).scalar() == 51000
+    assert db.payouts.find_one()["net_paise"] == 51000
 
 
 def test_doctor_cannot_touch_other_doctors_appointments(client, db):
@@ -305,9 +309,8 @@ def test_worker_creates_video_room_and_flags_unmarked(client, db):
     b = book_and_pay(client, d["doctor_id"])
     _move_to_past(db, b["id"], minutes_ago=5)
     # Video room job is due 10 min before start
-    db.execute(text("UPDATE outbox SET due_at = now() - interval '1 minute' "
-                    "WHERE appointment_id = :i AND template = 'create_video_room'"), {"i": b["id"]})
-    db.commit()
+    db.outbox.update_many({"appointment_id": ObjectId(b["id"]), "template": "create_video_room"},
+                          {"$set": {"due_at": datetime.now(UTC) - timedelta(minutes=1)}})
     worker.run_once()
     mine = client.get(f"/appointments/{b['id']}", headers=MEMBER).json()
     assert mine["member_status"] == "in_progress"
@@ -327,9 +330,9 @@ def test_worker_processes_refunds(client, db):
     b = book_and_pay(client, d["doctor_id"])
     client.post(f"/appointments/{b['id']}/cancel", headers=MEMBER, json={})
     worker.run_once()
-    refund_id = db.execute(text("SELECT razorpay_refund_id FROM appointments WHERE id = :i"), {"i": b["id"]}).scalar()
+    refund_id = _appt(db, b["id"])["razorpay_refund_id"]
     assert refund_id.startswith("rfnd_")
     # Reminders for the cancelled appointment were cancelled, not sent
-    sent = db.execute(text("SELECT count(*) FROM outbox WHERE appointment_id = :i AND template = 'appointment_reminder' "
-                           "AND status = 'pending'"), {"i": b["id"]}).scalar()
+    sent = db.outbox.count_documents({"appointment_id": ObjectId(b["id"]), "template": "appointment_reminder",
+                                      "status": "pending"})
     assert sent == 0

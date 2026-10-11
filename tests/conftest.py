@@ -6,37 +6,36 @@ import shutil
 import tempfile
 from datetime import timedelta
 
-os.environ.setdefault("SUPPAI_DATABASE_URL", "postgresql+psycopg://suppai:suppai@localhost:5432/suppai_test")
+# Set SUPPAI_MONGO_URL=mongodb://localhost:27017 to run against a real MongoDB.
+os.environ.setdefault("SUPPAI_MONGO_URL", "mongomock://")
+os.environ.setdefault("SUPPAI_MONGO_DB", "suppai_test")
 os.environ["SUPPAI_STORAGE_DIR"] = tempfile.mkdtemp(prefix="suppai-test-")
 os.environ["SUPPAI_PAYMENTS_PROVIDER"] = "fake"
 os.environ["SUPPAI_JWT_SECRET"] = "test-secret-that-is-at-least-32-bytes-long"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import text  # noqa: E402
 
-import app.models  # noqa: E402,F401
 from app.config import get_settings  # noqa: E402
-from app.db import Base, SessionLocal, engine  # noqa: E402
+from app.db import get_db  # noqa: E402
+from app.models import ensure_indexes  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.security import _VERHOEFF_D, _VERHOEFF_P, create_access_token  # noqa: E402
 from app.services.slots import today_ist  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _schema():
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
+def _storage():
     yield
     shutil.rmtree(get_settings().storage_dir, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
 def _clean():
-    tables = ", ".join(t.name for t in Base.metadata.sorted_tables)
-    with engine.begin() as c:
-        c.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
-        c.execute(text("ALTER SEQUENCE doctor_application_ref_seq RESTART WITH 3301"))
+    db = get_db()
+    for name in db.list_collection_names():
+        db.drop_collection(name)
+    ensure_indexes(db)
     yield
 
 
@@ -47,9 +46,7 @@ def client():
 
 @pytest.fixture
 def db():
-    s = SessionLocal()
-    yield s
-    s.close()
+    return get_db()
 
 
 def bearer(role: str, sub: str = "1", **extra) -> dict:
@@ -104,11 +101,9 @@ def upload_docs(client, app_id, token):
 
 
 def latest_link_token(db, email: str) -> str:
-    row = db.execute(
-        text("SELECT payload FROM outbox WHERE recipient = :e AND template IN ('doctor_invite', 'doctor_password_reset') "
-             "ORDER BY id DESC LIMIT 1"), {"e": email}
-    ).scalar_one()
-    return row["link"].split("token=")[1]
+    row = db.outbox.find_one({"recipient": email, "template": {"$in": ["doctor_invite", "doctor_password_reset"]}},
+                             sort=[("_id", -1)])
+    return row["payload"]["link"].split("token=")[1]
 
 
 def onboard_doctor(client, db, name="Dr. Leela Menon", email="leela.menon@gmail.com", modes=("video",),

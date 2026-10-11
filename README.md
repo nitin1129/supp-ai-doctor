@@ -2,13 +2,13 @@
 
 Backend for the SuppAI doctor flow: a doctor applies, an admin reviews and accepts, the doctor signs in and runs appointments, and a member books and tracks a consult. It implements *SuppAI Doctors Flow v1 (29 Sep 2026)*, plus the gaps found while reviewing that doc (listed below).
 
-Stack: FastAPI · SQLAlchemy 2 · Postgres 16 · Alembic · Razorpay · argon2 · JWT.
+Stack: FastAPI · MongoDB (pymongo) · Razorpay · argon2 · JWT. Works on a standalone mongod, a replica set or Atlas; no multi-document transactions are needed.
 
 ## Run it
 
 ```bash
 cp .env.example .env            # fill SUPPAI_JWT_SECRET and SUPPAI_DATA_ENCRYPTION_KEY
-docker compose up --build       # Postgres + API on :8000 + worker
+docker compose up --build       # MongoDB + API on :8000 + worker
 open http://localhost:8000/docs # interactive API docs
 ```
 
@@ -16,16 +16,15 @@ Without Docker:
 
 ```bash
 pip install -r requirements.txt
-alembic upgrade head
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload   # creates the indexes on startup (or: python -m app.models)
 python -m app.worker            # separate terminal
 ```
 
-Tests run against a real Postgres (the partial unique index and row locks are part of what's tested):
+Tests use an in-memory MongoDB (mongomock) by default, so they need no server:
 
 ```bash
-createdb suppai_test
-SUPPAI_DATABASE_URL=postgresql+psycopg://suppai:suppai@localhost:5432/suppai_test pytest
+pytest
+SUPPAI_MONGO_URL=mongodb://localhost:27017 pytest   # against a real MongoDB (uses the suppai_test database)
 ```
 
 ## How it connects to the rest of suppai.in
@@ -79,6 +78,24 @@ SUPPAI_DATABASE_URL=postgresql+psycopg://suppai:suppai@localhost:5432/suppai_tes
 | `POST /appointments/{id}/review` | 1–5 stars after a completed consult |
 | `POST /payments/razorpay/webhook` | Marks paid; idempotent |
 
+## How MongoDB is used
+
+| Collection | Holds |
+|---|---|
+| `doctor_applications` | One per application. The seven steps are in `data`; uploads are embedded in `documents`. |
+| `doctors` | Approved doctors. Weekly hours are embedded in `hours` as IST minutes (`{weekday, start_min, end_min}`). |
+| `doctor_users`, `password_tokens` | Doctor logins and one-time set-password links (only hashes are stored). |
+| `doctor_leave` | Days off, unique per doctor and date. |
+| `appointments` | Bookings, with a doctor snapshot in `doctor` and the timeline embedded in `events`. |
+| `payouts`, `reviews`, `profile_change_requests` | One payout and one review per appointment (unique indexes). |
+| `payment_webhook_events`, `audit_log`, `outbox`, `counters` | Webhook idempotency, admin audit, notification queue, SA-DOC numbering. |
+
+Consistency without transactions:
+- Every status change is a conditional update on the current status (`find_one_and_update({_id, status: …})`), so two requests can't both move the same record.
+- Accepting an application claims it first. If any later step fails, the doctor and login it created are removed again.
+- `appointments.holds_slot` is kept in step with the status and drives the unique slot index. `models.status_fields()` sets both together.
+- The outbox entry is written right after the change it belongs to, and jobs re-check the appointment before acting.
+
 ## Statuses
 
 **Application:** `draft → submitted → under_review → accepted`, with `on_hold` (the doctor edits and resubmits under the same SA-DOC reference) and `rejected`.
@@ -108,7 +125,7 @@ These fill gaps in the v1 doc. All the numbers are settings in `.env`.
 - **Day off with bookings** returns 409 with the affected consults. The doctor confirms with `cancel_booked: true`, which cancels them with a full refund and sends the doctor's note to the members.
 - **Late payments:** if Razorpay confirms after the hold has lapsed and the slot is still free, the booking goes through. If the slot is taken, the payment is refunded automatically.
 - **Commission is 15%** (`COMMISSION_PERCENT`). This is a placeholder; set your real rate.
-- **Double booking** is blocked twice: a per-doctor row lock during booking, plus a partial unique index on `(doctor_id, start_at)` for active statuses.
+- **Double booking** is blocked twice: a short per-doctor lease while a booking is checked and written, plus a unique index on `(doctor_id, start_at)` limited to appointments with `holds_slot: true`.
 - **Times** are stored in UTC and returned with an IST label. Weekly hours are IST wall-clock times.
 
 ## Not built yet

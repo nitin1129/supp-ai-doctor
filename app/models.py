@@ -1,37 +1,26 @@
-"""Database tables for the SuppAI doctor flow.
+"""MongoDB collections for the SuppAI doctor flow.
 
-Money is stored in paise (integers). Times are stored in UTC (timestamptz) and
-converted to IST at the edge.
+Money is stored in paise (integers). Times are stored as UTC datetimes and
+converted to IST at the edge. Weekly hours are IST wall-clock minutes.
+
+Collections
+-----------
+doctor_applications  one per application; the seven steps live in `data`,
+                     uploaded files in `documents` (embedded)
+doctors              approved doctors; weekly hours embedded in `hours`
+doctor_users         login for each doctor
+password_tokens      one-time set-password links (hash only)
+doctor_leave         days off, one per (doctor_id, date)
+appointments         bookings; timeline embedded in `events`, doctor snapshot
+                     in `doctor`
+payment_webhook_events, payouts, reviews, profile_change_requests,
+audit_log, outbox, counters
 """
 
-from datetime import date, datetime, time
 from enum import StrEnum
 
-from sqlalchemy import (
-    ARRAY,
-    BigInteger,
-    CheckConstraint,
-    Date,
-    DateTime,
-    ForeignKey,
-    Index,
-    Integer,
-    Sequence,
-    String,
-    Text,
-    Time,
-    UniqueConstraint,
-    func,
-    text,
-)
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.db import Base
-
-
-# Human-facing application references: SA-DOC-3301, SA-DOC-3302, ...
-application_ref_seq = Sequence("doctor_application_ref_seq", start=3301, metadata=Base.metadata)
+from pymongo import ASCENDING, DESCENDING, IndexModel
+from pymongo.database import Database
 
 
 class ApplicationStatus(StrEnum):
@@ -58,347 +47,74 @@ class AppointmentStatus(StrEnum):
     NEEDS_REVIEW = "needs_review"  # doctor never marked Done/No-show; admin resolves
 
 
-# Statuses that occupy a slot. Used by the partial unique index and slot engine.
-SLOT_HOLDING_STATUSES = (
+# Statuses that occupy a slot. `holds_slot` is kept in step with these.
+SLOT_HOLDING_STATUSES = {
     AppointmentStatus.PENDING_PAYMENT,
     AppointmentStatus.BOOKED,
     AppointmentStatus.COMPLETED,
     AppointmentStatus.NO_SHOW,
     AppointmentStatus.NEEDS_REVIEW,
-)
+}
 
 
-def _ts() -> Mapped[datetime]:
-    return mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+def status_fields(status: AppointmentStatus) -> dict:
+    """Use this whenever an appointment's status changes."""
+    return {"status": status.value, "holds_slot": status in SLOT_HOLDING_STATUSES}
 
 
-def _str_enum_check(table: str, column: str, enum: type[StrEnum]) -> CheckConstraint:
-    values = ", ".join(f"'{v.value}'" for v in enum)
-    return CheckConstraint(f"{column} IN ({values})", name=f"ck_{table}_{column}")
-
-
-class DoctorApplication(Base):
-    __tablename__ = "doctor_applications"
-    __table_args__ = (_str_enum_check("doctor_applications", "status", ApplicationStatus),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    reference: Mapped[str | None] = mapped_column(String(20), unique=True)
-    status: Mapped[str] = mapped_column(String(20), default=ApplicationStatus.DRAFT, index=True)
-    resume_token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    current_step: Mapped[int] = mapped_column(Integer, default=1)
-
-    # Non-sensitive answers from the seven steps, keyed by section.
-    data: Mapped[dict] = mapped_column(JSONB, default=dict)
-
-    # Denormalised for listing and search.
-    full_name: Mapped[str | None] = mapped_column(String(200))
-    email: Mapped[str | None] = mapped_column(String(254))
-    mobile: Mapped[str | None] = mapped_column(String(15))
-
-    # Sensitive identity and bank fields. Aadhaar is never stored in full.
-    pan_encrypted: Mapped[str | None] = mapped_column(Text)
-    aadhaar_last4: Mapped[str | None] = mapped_column(String(4))
-    bank_account_encrypted: Mapped[str | None] = mapped_column(Text)
-    bank_account_last4: Mapped[str | None] = mapped_column(String(4))
-
-    review_note: Mapped[str | None] = mapped_column(Text)
-    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    reviewed_by: Mapped[str | None] = mapped_column(String(64))
-    doctor_id: Mapped[int | None] = mapped_column(ForeignKey("doctors.id"))
-
-    created_at: Mapped[datetime] = _ts()
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-    documents: Mapped[list["ApplicationDocument"]] = relationship(
-        back_populates="application", order_by="ApplicationDocument.id"
-    )
-
-
-class ApplicationDocument(Base):
-    __tablename__ = "application_documents"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    application_id: Mapped[int] = mapped_column(
-        ForeignKey("doctor_applications.id", ondelete="CASCADE"), index=True
-    )
-    kind: Mapped[str] = mapped_column(String(50))
-    filename: Mapped[str] = mapped_column(String(255))
-    content_type: Mapped[str] = mapped_column(String(100))
-    size_bytes: Mapped[int] = mapped_column(Integer)
-    storage_key: Mapped[str] = mapped_column(String(255), unique=True)
-    uploaded_at: Mapped[datetime] = _ts()
-
-    application: Mapped[DoctorApplication] = relationship(back_populates="documents")
-
-
-class Doctor(Base):
-    __tablename__ = "doctors"
-    __table_args__ = (
-        _str_enum_check("doctors", "status", DoctorStatus),
-        CheckConstraint("fee_paise >= 0", name="ck_fee_nonnegative"),
-        CheckConstraint("slot_minutes BETWEEN 5 AND 120", name="ck_slot_minutes"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    application_id: Mapped[int | None] = mapped_column(Integer, unique=True)
-    status: Mapped[str] = mapped_column(String(20), default=DoctorStatus.ACTIVE, index=True)
-    status_note: Mapped[str | None] = mapped_column(Text)
-
-    full_name: Mapped[str] = mapped_column(String(200))
-    gender: Mapped[str | None] = mapped_column(String(20))
-    email: Mapped[str] = mapped_column(String(254))
-    mobile: Mapped[str | None] = mapped_column(String(15))
-
-    specialties: Mapped[list[str]] = mapped_column(ARRAY(String(80)), default=list)
-    qualifications: Mapped[list[str]] = mapped_column(ARRAY(String(120)), default=list)
-    languages: Mapped[list[str]] = mapped_column(ARRAY(String(40)), default=list)
-    modes: Mapped[list[str]] = mapped_column(ARRAY(String(10)), default=lambda: ["video"])
-
-    registration_number: Mapped[str | None] = mapped_column(String(60))
-    registration_council: Mapped[str | None] = mapped_column(String(120))
-    registration_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    experience_years: Mapped[int] = mapped_column(Integer, default=0)
-
-    bio: Mapped[str | None] = mapped_column(Text)
-    fee_paise: Mapped[int] = mapped_column(Integer, default=0)
-    clinic_address: Mapped[str | None] = mapped_column(Text)
-    clinic_pincode: Mapped[str | None] = mapped_column(String(6), index=True)
-
-    slot_minutes: Mapped[int] = mapped_column(Integer, default=15)
-    notice_minutes: Mapped[int] = mapped_column(Integer, default=120)
-
-    rating_sum: Mapped[int] = mapped_column(Integer, default=0)
-    rating_count: Mapped[int] = mapped_column(Integer, default=0)
-
-    pan_encrypted: Mapped[str | None] = mapped_column(Text)
-    aadhaar_last4: Mapped[str | None] = mapped_column(String(4))
-    bank_account_encrypted: Mapped[str | None] = mapped_column(Text)
-    bank_account_last4: Mapped[str | None] = mapped_column(String(4))
-    bank_ifsc: Mapped[str | None] = mapped_column(String(11))
-
-    created_at: Mapped[datetime] = _ts()
-
-    user: Mapped["DoctorUser"] = relationship(back_populates="doctor", uselist=False)
-    hours: Mapped[list["DoctorHours"]] = relationship(
-        back_populates="doctor", cascade="all, delete-orphan", order_by="DoctorHours.weekday"
-    )
-
-
-class DoctorUser(Base):
-    __tablename__ = "doctor_users"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    doctor_id: Mapped[int] = mapped_column(ForeignKey("doctors.id"), unique=True)
-    username: Mapped[str] = mapped_column(String(80), unique=True)
-    email: Mapped[str] = mapped_column(String(254), unique=True)
-    password_hash: Mapped[str | None] = mapped_column(Text)
-    password_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    failed_logins: Mapped[int] = mapped_column(Integer, default=0)
-    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    token_version: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = _ts()
-
-    doctor: Mapped[Doctor] = relationship(back_populates="user")
-
-
-class PasswordToken(Base):
-    """One-time set-password link sent by email. Only the hash is stored."""
-
-    __tablename__ = "password_tokens"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    doctor_user_id: Mapped[int] = mapped_column(ForeignKey("doctor_users.id"), index=True)
-    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = _ts()
-
-
-class DoctorHours(Base):
-    __tablename__ = "doctor_hours"
-    __table_args__ = (
-        CheckConstraint("weekday BETWEEN 0 AND 6", name="ck_weekday"),
-        CheckConstraint("end_time > start_time", name="ck_window_order"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    doctor_id: Mapped[int] = mapped_column(ForeignKey("doctors.id", ondelete="CASCADE"), index=True)
-    weekday: Mapped[int] = mapped_column(Integer)  # 0 = Monday, IST
-    start_time: Mapped[time] = mapped_column(Time)  # IST wall clock
-    end_time: Mapped[time] = mapped_column(Time)
-
-    doctor: Mapped[Doctor] = relationship(back_populates="hours")
-
-
-class DoctorLeave(Base):
-    __tablename__ = "doctor_leave"
-    __table_args__ = (UniqueConstraint("doctor_id", "date", name="uq_leave_doctor_date"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    doctor_id: Mapped[int] = mapped_column(ForeignKey("doctors.id", ondelete="CASCADE"), index=True)
-    date: Mapped[date] = mapped_column(Date)  # IST calendar date
-    note: Mapped[str | None] = mapped_column(String(280))  # shown to patients
-    created_at: Mapped[datetime] = _ts()
-
-
-class Appointment(Base):
-    __tablename__ = "appointments"
-    __table_args__ = (
-        _str_enum_check("appointments", "status", AppointmentStatus),
-        CheckConstraint("mode IN ('video', 'clinic')", name="ck_mode"),
-        CheckConstraint("end_at > start_at", name="ck_appt_order"),
+INDEXES: dict[str, list[IndexModel]] = {
+    "doctor_applications": [
+        IndexModel("resume_token_hash", unique=True),
+        IndexModel("reference", unique=True, partialFilterExpression={"reference": {"$type": "string"}}),
+        IndexModel([("status", ASCENDING), ("submitted_at", DESCENDING)]),
+    ],
+    "doctors": [
+        IndexModel("status"),
+        IndexModel("specialties"),
+        IndexModel("clinic_pincode"),
+    ],
+    "doctor_users": [
+        IndexModel("doctor_id", unique=True),
+        IndexModel("username", unique=True),
+        IndexModel("email", unique=True),
+    ],
+    "password_tokens": [IndexModel("token_hash", unique=True), IndexModel("doctor_user_id")],
+    "doctor_leave": [IndexModel([("doctor_id", ASCENDING), ("date", ASCENDING)], unique=True)],
+    "appointments": [
         # Makes a double booking impossible at the database level.
-        Index(
-            "uq_appointment_doctor_start_active",
-            "doctor_id",
-            "start_at",
+        IndexModel(
+            [("doctor_id", ASCENDING), ("start_at", ASCENDING)],
             unique=True,
-            postgresql_where=text(
-                "status IN (" + ", ".join(f"'{s.value}'" for s in SLOT_HOLDING_STATUSES) + ")"
-            ),
+            partialFilterExpression={"holds_slot": True},
+            name="uq_doctor_start_active",
         ),
-        Index("ix_appointments_doctor_start", "doctor_id", "start_at"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    doctor_id: Mapped[int] = mapped_column(ForeignKey("doctors.id"))
-    member_id: Mapped[str] = mapped_column(String(64), index=True)
-    patient: Mapped[dict] = mapped_column(JSONB)
-    mode: Mapped[str] = mapped_column(String(10))
-    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    status: Mapped[str] = mapped_column(String(20), default=AppointmentStatus.PENDING_PAYMENT, index=True)
-    hold_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-    fee_paise: Mapped[int] = mapped_column(Integer)
-    amount_paid_paise: Mapped[int] = mapped_column(Integer, default=0)
-    razorpay_order_id: Mapped[str | None] = mapped_column(String(64), unique=True)
-    razorpay_payment_id: Mapped[str | None] = mapped_column(String(64))
-    refund_paise: Mapped[int] = mapped_column(Integer, default=0)
-    refund_status: Mapped[str | None] = mapped_column(String(20))  # pending / processed / failed
-    razorpay_refund_id: Mapped[str | None] = mapped_column(String(64))
-
-    video_room_url: Mapped[str | None] = mapped_column(Text)
-    clinic_address: Mapped[str | None] = mapped_column(Text)
-    cancelled_by: Mapped[str | None] = mapped_column(String(10))  # member / doctor / admin / system
-    cancel_reason: Mapped[str | None] = mapped_column(Text)
-    reschedule_count: Mapped[int] = mapped_column(Integer, default=0)
-
-    created_at: Mapped[datetime] = _ts()
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-    doctor: Mapped[Doctor] = relationship()
-    events: Mapped[list["AppointmentEvent"]] = relationship(
-        back_populates="appointment", order_by="AppointmentEvent.id"
-    )
+        IndexModel([("doctor_id", ASCENDING), ("status", ASCENDING), ("start_at", ASCENDING)], name="doctor_status_start"),
+        IndexModel([("member_id", ASCENDING), ("start_at", DESCENDING)]),
+        IndexModel("razorpay_order_id", unique=True, partialFilterExpression={"razorpay_order_id": {"$type": "string"}}),
+        IndexModel("razorpay_payment_id"),
+        IndexModel("status"),
+    ],
+    "payment_webhook_events": [IndexModel("provider_event_id", unique=True)],
+    "payouts": [IndexModel("appointment_id", unique=True), IndexModel("doctor_id")],
+    "reviews": [IndexModel("appointment_id", unique=True), IndexModel("doctor_id")],
+    "profile_change_requests": [IndexModel([("status", ASCENDING), ("created_at", ASCENDING)]), IndexModel("doctor_id")],
+    "audit_log": [IndexModel([("entity_type", ASCENDING), ("entity_id", ASCENDING)]), IndexModel("action")],
+    "outbox": [IndexModel([("status", ASCENDING), ("due_at", ASCENDING)]), IndexModel("appointment_id")],
+}
 
 
-class AppointmentEvent(Base):
-    __tablename__ = "appointment_events"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    appointment_id: Mapped[int] = mapped_column(
-        ForeignKey("appointments.id", ondelete="CASCADE"), index=True
-    )
-    type: Mapped[str] = mapped_column(String(40))
-    actor_type: Mapped[str] = mapped_column(String(10))
-    actor_id: Mapped[str | None] = mapped_column(String(64))
-    data: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = _ts()
-
-    appointment: Mapped[Appointment] = relationship(back_populates="events")
+def ensure_indexes(db: Database) -> None:
+    # One create_index call per index (rather than create_indexes) so the
+    # in-memory test database also keeps partialFilterExpression.
+    for name, indexes in INDEXES.items():
+        for idx in indexes:
+            spec = dict(idx.document)
+            keys = list(spec.pop("key").items())
+            db[name].create_index(keys, **spec)
 
 
-class PaymentWebhookEvent(Base):
-    """Stores each Razorpay webhook once so retries are idempotent."""
+if __name__ == "__main__":
+    from app.db import get_db
 
-    __tablename__ = "payment_webhook_events"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    provider_event_id: Mapped[str] = mapped_column(String(100), unique=True)
-    event: Mapped[str] = mapped_column(String(60))
-    payload: Mapped[dict] = mapped_column(JSONB)
-    received_at: Mapped[datetime] = _ts()
-
-
-class Payout(Base):
-    __tablename__ = "payouts"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    doctor_id: Mapped[int] = mapped_column(ForeignKey("doctors.id"), index=True)
-    appointment_id: Mapped[int] = mapped_column(ForeignKey("appointments.id"), unique=True)
-    gross_paise: Mapped[int] = mapped_column(Integer)
-    commission_paise: Mapped[int] = mapped_column(Integer)
-    net_paise: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(20), default="queued")  # queued / paid / void
-    created_at: Mapped[datetime] = _ts()
-    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-
-class Review(Base):
-    __tablename__ = "reviews"
-    __table_args__ = (CheckConstraint("rating BETWEEN 1 AND 5", name="ck_rating"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    appointment_id: Mapped[int] = mapped_column(ForeignKey("appointments.id"), unique=True)
-    doctor_id: Mapped[int] = mapped_column(ForeignKey("doctors.id"), index=True)
-    member_id: Mapped[str] = mapped_column(String(64))
-    rating: Mapped[int] = mapped_column(Integer)
-    comment: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = _ts()
-
-
-class ProfileChangeRequest(Base):
-    """Fee or specialty changes wait here for admin approval."""
-
-    __tablename__ = "profile_change_requests"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    doctor_id: Mapped[int] = mapped_column(ForeignKey("doctors.id"), index=True)
-    changes: Mapped[dict] = mapped_column(JSONB)
-    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending/approved/rejected
-    note: Mapped[str | None] = mapped_column(Text)
-    decided_by: Mapped[str | None] = mapped_column(String(64))
-    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = _ts()
-
-
-class AuditLog(Base):
-    __tablename__ = "audit_log"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    actor_type: Mapped[str] = mapped_column(String(10))
-    actor_id: Mapped[str | None] = mapped_column(String(64))
-    action: Mapped[str] = mapped_column(String(60), index=True)
-    entity_type: Mapped[str] = mapped_column(String(40))
-    entity_id: Mapped[str] = mapped_column(String(40))
-    data: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = _ts()
-
-
-class Outbox(Base):
-    """Notifications and timed jobs, processed by app.worker."""
-
-    __tablename__ = "outbox"
-    __table_args__ = (Index("ix_outbox_due", "status", "due_at"),)
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    channel: Mapped[str] = mapped_column(String(10))  # email / sms / whatsapp / job
-    template: Mapped[str] = mapped_column(String(60))
-    recipient: Mapped[str | None] = mapped_column(String(254))
-    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
-    appointment_id: Mapped[int | None] = mapped_column(
-        ForeignKey("appointments.id", ondelete="CASCADE"), index=True
-    )
-    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    status: Mapped[str] = mapped_column(String(10), default="pending")  # pending/sent/failed/cancelled
-    attempts: Mapped[int] = mapped_column(Integer, default=0)
-    last_error: Mapped[str | None] = mapped_column(Text)
-    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = _ts()
+    ensure_indexes(get_db())
+    print("Indexes are in place.")

@@ -1,7 +1,8 @@
 """Background worker: delivers the outbox and runs timed jobs.
 
-Run with `python -m app.worker` (loops) or call run_once() from a cron/Celery
-beat. Rows are claimed with SKIP LOCKED, so several workers can run safely.
+Run with `python -m app.worker` (loops) or call run_once() from cron. Each
+entry is claimed atomically (pending → processing), so several workers can run
+side by side. Entries stuck in processing for 10 minutes are retried.
 
 Delivery is pluggable: replace `deliver_message` with your email (SES,
 SendGrid), SMS and WhatsApp (MSG91, Gupshup) senders. Recipients of the form
@@ -11,57 +12,63 @@ contacts live in the main SuppAI platform.
 
 import logging
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
-from sqlalchemy import select, update
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
-from app.db import SessionLocal
-from app.models import Appointment, AppointmentStatus, Outbox
+from app.db import get_db
+from app.db import now as db_now
+from app.models import AppointmentStatus, status_fields
 from app.services import payments, video
 from app.services.audit import appointment_event
 from app.services.outbox import enqueue
 
 log = logging.getLogger("suppai.worker")
 MAX_ATTEMPTS = 5
+STUCK_AFTER = timedelta(minutes=10)
 
 
-def deliver_message(row: Outbox) -> None:
+def deliver_message(row: dict) -> None:
     """Default sender: logs. Swap in real providers for production."""
-    log.info("SEND %s %s → %s %s", row.channel, row.template, row.recipient, row.payload)
+    log.info("SEND %s %s → %s %s", row["channel"], row["template"], row["recipient"], row["payload"])
 
 
-def _job_create_video_room(db: Session, row: Outbox) -> None:
-    appt = db.get(Appointment, row.appointment_id)
-    if appt is None or appt.status != AppointmentStatus.BOOKED or appt.mode != "video":
+def _job_create_video_room(db: Database, row: dict) -> None:
+    appt = db.appointments.find_one({"_id": row["appointment_id"]})
+    if appt is None or appt["status"] != AppointmentStatus.BOOKED or appt["mode"] != "video":
         return
-    if not appt.video_room_url:
-        appt.video_room_url = video.create_room(appt.id)
-        appointment_event(db, appt.id, "video_room_created", "system")
-    for r in (f"member:{appt.member_id}", f"doctor:{appt.doctor_id}"):
-        enqueue(db, channel="notify", template="video_link", recipient=r, appointment_id=appt.id,
-                payload={"url": appt.video_room_url})
+    url = appt.get("video_room_url")
+    if not url:
+        url = video.create_room(str(appt["_id"]))
+        db.appointments.update_one({"_id": appt["_id"], "video_room_url": None}, {"$set": {"video_room_url": url}})
+        appointment_event(db, appt["_id"], "video_room_created", "system")
+    for r in (f"member:{appt['member_id']}", f"doctor:{appt['doctor_id']}"):
+        enqueue(db, channel="notify", template="video_link", recipient=r, appointment_id=appt["_id"],
+                payload={"url": url})
 
 
-def _job_check_unmarked(db: Session, row: Outbox) -> None:
-    appt = db.get(Appointment, row.appointment_id)
-    if appt is None or appt.status != AppointmentStatus.BOOKED:
-        return
-    appt.status = AppointmentStatus.NEEDS_REVIEW
-    appointment_event(db, appt.id, "needs_review", "system", data={"reason": "doctor did not mark Done or No-show"})
-    enqueue(db, channel="email", template="appointment_needs_review", recipient="ops", appointment_id=appt.id)
+def _job_check_unmarked(db: Database, row: dict) -> None:
+    res = db.appointments.update_one(
+        {"_id": row["appointment_id"], "status": AppointmentStatus.BOOKED.value},
+        {"$set": status_fields(AppointmentStatus.NEEDS_REVIEW)},
+    )
+    if res.modified_count:
+        appointment_event(db, row["appointment_id"], "needs_review", "system",
+                          data={"reason": "doctor did not mark Done or No-show"})
+        enqueue(db, channel="email", template="appointment_needs_review", recipient="ops",
+                appointment_id=row["appointment_id"])
 
 
-def _job_refund(db: Session, row: Outbox) -> None:
-    appt = db.get(Appointment, row.appointment_id)
-    if appt is None or not appt.razorpay_payment_id:
+def _job_refund(db: Database, row: dict) -> None:
+    appt = db.appointments.find_one({"_id": row["appointment_id"]})
+    if appt is None or not appt.get("razorpay_payment_id"):
         return
     refund_id = payments.provider().refund(
-        appt.razorpay_payment_id, int(row.payload["amount_paise"]),
-        notes={"appointment_id": str(appt.id), "reason": row.payload.get("reason", "")},
+        appt["razorpay_payment_id"], int(row["payload"]["amount_paise"]),
+        notes={"appointment_id": str(appt["_id"]), "reason": row["payload"].get("reason", "")},
     )
-    appt.razorpay_refund_id = refund_id
-    appointment_event(db, appt.id, "refund_requested", "system", data={**row.payload, "refund_id": refund_id})
+    db.appointments.update_one({"_id": appt["_id"]}, {"$set": {"razorpay_refund_id": refund_id}})
+    appointment_event(db, appt["_id"], "refund_requested", "system", data={**row["payload"], "refund_id": refund_id})
 
 
 JOBS = {
@@ -71,63 +78,64 @@ JOBS = {
 }
 
 
-def _still_relevant(db: Session, row: Outbox) -> bool:
-    if row.template != "appointment_reminder" or row.appointment_id is None:
+def _still_relevant(db: Database, row: dict) -> bool:
+    if row["template"] != "appointment_reminder" or row.get("appointment_id") is None:
         return True
-    appt = db.get(Appointment, row.appointment_id)
-    return appt is not None and appt.status == AppointmentStatus.BOOKED
+    appt = db.appointments.find_one({"_id": row["appointment_id"]}, {"status": 1})
+    return appt is not None and appt["status"] == AppointmentStatus.BOOKED
 
 
-def expire_holds(db: Session, now: datetime) -> int:
-    res = db.execute(
-        update(Appointment)
-        .where(Appointment.status == AppointmentStatus.PENDING_PAYMENT, Appointment.hold_expires_at <= now)
-        .values(status=AppointmentStatus.EXPIRED)
+def expire_holds(db: Database, now: datetime) -> int:
+    res = db.appointments.update_many(
+        {"status": AppointmentStatus.PENDING_PAYMENT.value, "hold_expires_at": {"$lte": now}},
+        {"$set": status_fields(AppointmentStatus.EXPIRED)},
     )
-    return res.rowcount
+    return res.modified_count
 
 
-def run_once(now: datetime | None = None, batch: int = 100, db: Session | None = None) -> int:
-    now = now or datetime.now(UTC)
-    own = db is None
-    db = db or SessionLocal()
-    processed = 0
+def _claim(db: Database, now: datetime) -> dict | None:
+    return db.outbox.find_one_and_update(
+        {"$or": [
+            {"status": "pending", "due_at": {"$lte": now}},
+            {"status": "processing", "claimed_at": {"$lt": now - STUCK_AFTER}},
+        ]},
+        {"$set": {"status": "processing", "claimed_at": now}},
+        sort=[("due_at", 1), ("_id", 1)],
+    )
+
+
+def _process(db: Database, row: dict, now: datetime) -> None:
     try:
-        expire_holds(db, now)
-        db.commit()
-        rows = db.scalars(
-            select(Outbox)
-            .where(Outbox.status == "pending", Outbox.due_at <= now)
-            .order_by(Outbox.due_at, Outbox.id)
-            .limit(batch)
-            .with_for_update(skip_locked=True)
-        ).all()
-        for row in rows:
-            try:
-                with db.begin_nested():
-                    if row.channel == "job":
-                        JOBS[row.template](db, row)
-                    elif _still_relevant(db, row):
-                        deliver_message(row)
-                row.status, row.sent_at = "sent", now
-            except Exception as e:  # retry with backoff
-                log.exception("Outbox %s failed", row.id)
-                row.attempts += 1
-                row.last_error = str(e)[:2000]
-                if row.attempts >= MAX_ATTEMPTS:
-                    row.status = "failed"
-                    if row.template == "refund" and row.appointment_id:
-                        appt = db.get(Appointment, row.appointment_id)
-                        if appt:
-                            appt.refund_status = "failed"
-                else:
-                    row.due_at = now + timedelta(minutes=2 ** row.attempts)
-            processed += 1
-        db.commit()
-        return processed
-    finally:
-        if own:
-            db.close()
+        if row["channel"] == "job":
+            JOBS[row["template"]](db, row)
+        elif _still_relevant(db, row):
+            deliver_message(row)
+        db.outbox.update_one({"_id": row["_id"]}, {"$set": {"status": "sent", "sent_at": now}})
+    except Exception as e:  # retry with backoff
+        log.exception("Outbox %s failed", row["_id"])
+        attempts = row.get("attempts", 0) + 1
+        update = {"attempts": attempts, "last_error": str(e)[:2000]}
+        if attempts >= MAX_ATTEMPTS:
+            update["status"] = "failed"
+            if row["template"] == "refund" and row.get("appointment_id"):
+                db.appointments.update_one({"_id": row["appointment_id"]}, {"$set": {"refund_status": "failed"}})
+        else:
+            update.update(status="pending", due_at=now + timedelta(minutes=2 ** attempts))
+        db.outbox.update_one({"_id": row["_id"]}, {"$set": update})
+
+
+def run_once(now: datetime | None = None, batch: int = 100, db: Database | None = None) -> int:
+    db = db if db is not None else get_db()
+    now = now or db_now()
+    expire_holds(db, now)
+    processed = 0
+    while processed < batch:
+        row = _claim(db, now)
+        if row is None:
+            break
+        _process(db, row, now)
+        processed += 1
+    return processed
 
 
 def main() -> None:

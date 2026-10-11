@@ -1,12 +1,13 @@
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import func, select
+from pymongo import ReturnDocument
 
 from app.config import get_settings
+from app.db import now
 from app.deps import DB
-from app.models import DoctorStatus, DoctorUser, PasswordToken
+from app.models import DoctorStatus
 from app.security import (
     create_access_token,
     hash_password,
@@ -28,7 +29,7 @@ class LoginIn(BaseModel):
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    doctor_id: int
+    doctor_id: str
     username: str
     expires_in: int
 
@@ -42,79 +43,85 @@ class ForgotIn(BaseModel):
     email: EmailStr
 
 
-def _token_for(user: DoctorUser) -> TokenOut:
+def _token_for(user: dict) -> TokenOut:
     s = get_settings()
     return TokenOut(
-        access_token=create_access_token(
-            {"sub": str(user.id), "role": "doctor", "doctor_id": user.doctor_id, "ver": user.token_version}
-        ),
-        doctor_id=user.doctor_id,
-        username=user.username,
+        access_token=create_access_token({
+            "sub": str(user["_id"]), "role": "doctor", "doctor_id": str(user["doctor_id"]),
+            "ver": user.get("token_version", 0),
+        }),
+        doctor_id=str(user["doctor_id"]),
+        username=user["username"],
         expires_in=s.access_token_minutes * 60,
     )
+
+
+def _doctor_active(db: DB, user: dict) -> bool:
+    d = db.doctors.find_one({"_id": user["doctor_id"]}, {"status": 1})
+    return d is not None and d["status"] == DoctorStatus.ACTIVE
 
 
 @router.post("/login", response_model=TokenOut)
 def login(body: LoginIn, db: DB) -> TokenOut:
     s = get_settings()
     ident = body.username.strip().lower()
-    user = db.scalar(
-        select(DoctorUser).where((DoctorUser.username == ident) | (func.lower(DoctorUser.email) == ident))
-    )
-    now = datetime.now(UTC)
+    # Emails are stored lower-case; usernames are always lower-case.
+    user = db.doctor_users.find_one({"$or": [{"username": ident}, {"email": ident}]})
+    t = now()
     bad = HTTPException(401, "Wrong username or password")
     if user is None:
         raise bad
-    if user.locked_until and user.locked_until > now:
+    if user.get("locked_until") and user["locked_until"] > t:
         raise HTTPException(423, "Too many attempts. Try again later or reset your password.")
-    if user.password_hash is None:
+    if not user.get("password_hash"):
         raise HTTPException(403, "Set your password from the invite email first")
-    if not verify_password(body.password, user.password_hash):
-        user.failed_logins += 1
-        if user.failed_logins >= s.login_max_failures:
-            user.locked_until = now + timedelta(minutes=s.login_lock_minutes)
-            user.failed_logins = 0
-        db.commit()
+    if not verify_password(body.password, user["password_hash"]):
+        updated = db.doctor_users.find_one_and_update(
+            {"_id": user["_id"]}, {"$inc": {"failed_logins": 1}}, return_document=ReturnDocument.AFTER
+        )
+        if updated["failed_logins"] >= s.login_max_failures:
+            db.doctor_users.update_one({"_id": user["_id"]}, {"$set": {
+                "locked_until": t + timedelta(minutes=s.login_lock_minutes), "failed_logins": 0}})
         raise bad
-    if user.doctor.status != DoctorStatus.ACTIVE:
+    if not _doctor_active(db, user):
         raise HTTPException(403, "Your account is suspended. Contact SuppAI support.")
-    user.failed_logins = 0
-    user.locked_until = None
-    user.last_login_at = now
-    db.commit()
+    db.doctor_users.update_one({"_id": user["_id"]},
+                               {"$set": {"failed_logins": 0, "locked_until": None, "last_login_at": t}})
     return _token_for(user)
 
 
 @router.post("/set-password", response_model=TokenOut)
 def set_password(body: SetPasswordIn, db: DB) -> TokenOut:
     """First login from the invite link, or a reset link. Signs the doctor in."""
-    now = datetime.now(UTC)
-    pt = db.scalar(select(PasswordToken).where(PasswordToken.token_hash == hash_token(body.token)))
-    if pt is None or pt.used_at is not None or pt.expires_at < now:
-        raise HTTPException(400, "This link has expired or was already used. Ask for a new one.")
     try:
         validate_password_strength(body.password)
     except ValueError as e:
         raise HTTPException(422, str(e))
-    user = db.get(DoctorUser, pt.doctor_user_id)
-    user.password_hash = hash_password(body.password)
-    user.password_set_at = now
-    user.token_version += 1  # signs out any other sessions
-    user.failed_logins = 0
-    user.locked_until = None
-    user.last_login_at = now
-    pt.used_at = now
-    audit(db, actor_type="doctor", actor_id=str(user.id), action="doctor.password_set",
-          entity_type="doctor", entity_id=user.doctor_id)
-    db.commit()
+    t = now()
+    # Claim the link atomically so it can only be used once.
+    pt = db.password_tokens.find_one_and_update(
+        {"token_hash": hash_token(body.token), "used_at": None, "expires_at": {"$gt": t}},
+        {"$set": {"used_at": t}},
+    )
+    if pt is None:
+        raise HTTPException(400, "This link has expired or was already used. Ask for a new one.")
+    user = db.doctor_users.find_one_and_update(
+        {"_id": pt["doctor_user_id"]},
+        {"$set": {"password_hash": hash_password(body.password), "password_set_at": t, "failed_logins": 0,
+                  "locked_until": None, "last_login_at": t},
+         "$inc": {"token_version": 1}},  # signs out any other sessions
+        return_document=ReturnDocument.AFTER,
+    )
+    audit(db, actor_type="doctor", actor_id=str(user["_id"]), action="doctor.password_set",
+          entity_type="doctor", entity_id=user["doctor_id"])
     return _token_for(user)
 
 
 @router.post("/forgot-password", status_code=202)
 def forgot_password(body: ForgotIn, db: DB) -> dict:
     """Always answers 202 so the endpoint can't be used to find registered emails."""
-    user = db.scalar(select(DoctorUser).where(func.lower(DoctorUser.email) == body.email.lower()))
-    if user is not None and user.doctor.status == DoctorStatus.ACTIVE:
+    user = db.doctor_users.find_one({"email": body.email.lower()})
+    if user is not None and _doctor_active(db, user):
         issue_set_password_link(db, user, template="doctor_password_reset")
-        db.commit()
     return {"message": "If that email is registered, a reset link is on its way."}
+

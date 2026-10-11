@@ -8,7 +8,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="SUPPAI_", extra="ignore")
 
     env: str = "dev"
-    database_url: str = "postgresql+psycopg://suppai:suppai@localhost:5432/suppai"
+    mongo_url: str = "mongodb://localhost:27017"  # "mongomock://" for an in-memory test database
+    mongo_db: str = "suppai"
 
     # Auth
     jwt_secret: str = "change-me"

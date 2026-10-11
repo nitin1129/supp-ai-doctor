@@ -10,24 +10,26 @@ from dataclasses import dataclass
 from typing import Annotated
 
 import jwt
+from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from app.db import get_db
-from app.models import Doctor, DoctorStatus, DoctorUser
+from app.models import DoctorStatus
 from app.security import decode_access_token
 
 _bearer = HTTPBearer(auto_error=False)
 
-DB = Annotated[Session, Depends(get_db)]
+DB = Annotated[Database, Depends(get_db)]
 
 
 @dataclass
 class Principal:
     role: str
     sub: str
-    doctor_id: int | None = None
+    doctor_id: str | None = None
     ver: int | None = None
 
 
@@ -56,19 +58,23 @@ def require_member(p: Principal = Depends(_principal)) -> Principal:
     return p
 
 
-def require_doctor(db: DB, p: Principal = Depends(_principal)) -> Doctor:
-    """Returns the signed-in doctor. doctor_id always comes from the token."""
-    if p.role != "doctor" or p.doctor_id is None:
+def require_doctor(db: DB, p: Principal = Depends(_principal)) -> dict:
+    """Returns the signed-in doctor's document. doctor_id always comes from the token."""
+    if p.role != "doctor" or not p.doctor_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Doctors only")
-    user = db.get(DoctorUser, int(p.sub))
-    if user is None or user.doctor_id != p.doctor_id or user.token_version != p.ver:
+    try:
+        user_id, doctor_id = ObjectId(p.sub), ObjectId(p.doctor_id)
+    except (InvalidId, TypeError):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session no longer valid")
-    doctor = db.get(Doctor, p.doctor_id)
-    if doctor is None or doctor.status != DoctorStatus.ACTIVE:
+    user = db.doctor_users.find_one({"_id": user_id})
+    if user is None or user["doctor_id"] != doctor_id or user.get("token_version", 0) != p.ver:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session no longer valid")
+    doctor = db.doctors.find_one({"_id": doctor_id})
+    if doctor is None or doctor["status"] != DoctorStatus.ACTIVE:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Doctor account is not active")
     return doctor
 
 
 Admin = Annotated[Principal, Depends(require_admin)]
 Member = Annotated[Principal, Depends(require_member)]
-CurrentDoctor = Annotated[Doctor, Depends(require_doctor)]
+CurrentDoctor = Annotated[dict, Depends(require_doctor)]

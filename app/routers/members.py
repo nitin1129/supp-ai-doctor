@@ -1,13 +1,16 @@
 """Member side: Consult (find and book) and Track → Consults."""
 
-from datetime import UTC, date, datetime
+import re
+from datetime import date
 
 from fastapi import APIRouter, HTTPException, Query
-from sqlalchemy import func, or_, select
+from pymongo import DESCENDING
+from pymongo.errors import DuplicateKeyError
 
 from app.config import get_settings
+from app.db import now, oid
 from app.deps import DB, Member
-from app.models import Appointment, AppointmentStatus, Doctor, DoctorStatus, Review
+from app.models import AppointmentStatus, DoctorStatus
 from app.schemas.booking import (
     AppointmentOut,
     BookIn,
@@ -26,6 +29,17 @@ from app.services.slots import day_slots, leave_on, next_available
 
 router = APIRouter(tags=["Member: consult"])
 
+PUBLIC_DOCTOR_FIELDS = {"pan_encrypted": 0, "bank_account_encrypted": 0, "aadhaar_last4": 0,
+                        "bank_account_last4": 0, "bank_ifsc": 0}
+
+
+def _active_doctor(db: DB, doctor_id: str) -> dict:
+    d = db.doctors.find_one({"_id": oid(doctor_id, "Doctor"), "status": DoctorStatus.ACTIVE.value},
+                            PUBLIC_DOCTOR_FIELDS)
+    if d is None:
+        raise HTTPException(404, "Doctor not found")
+    return d
+
 
 # --- Find a doctor ---------------------------------------------------------------
 
@@ -41,62 +55,55 @@ def find_doctors(
 ) -> list[DoctorCard]:
     """Active doctors. With a pincode, in-clinic doctors must be at that pincode;
     video doctors are shown wherever the member is."""
-    query = select(Doctor).where(Doctor.status == DoctorStatus.ACTIVE, Doctor.fee_paise >= 0)
+    query: dict = {"status": DoctorStatus.ACTIVE.value}
     if specialty:
-        query = query.where(func.lower(func.array_to_string(Doctor.specialties, "|")).like(f"%{specialty.lower()}%"))
-    if mode:
-        query = query.where(Doctor.modes.any(mode))
-    if pincode:
-        if mode == "clinic":
-            query = query.where(Doctor.clinic_pincode == pincode)
-        else:
-            query = query.where(or_(Doctor.modes.any("video"), Doctor.clinic_pincode == pincode))
+        query["specialties"] = {"$regex": re.escape(specialty), "$options": "i"}
     if q:
-        query = query.where(func.lower(Doctor.full_name).like(f"%{q.lower()}%"))
-    doctors = db.scalars(
-        query.order_by(Doctor.rating_count.desc(), Doctor.experience_years.desc(), Doctor.id)
-        .offset(offset).limit(limit)
-    ).all()
-    now = datetime.now(UTC)
-    cards = [doctor_card(d, next_available(db, d, now)) for d in doctors]
+        query["full_name"] = {"$regex": re.escape(q), "$options": "i"}
+    if pincode and mode == "clinic":
+        query["modes"] = "clinic"
+        query["clinic_pincode"] = pincode
+    elif pincode:
+        if mode:
+            query["modes"] = mode
+        query["$or"] = [{"modes": "video"}, {"clinic_pincode": pincode}]
+    elif mode:
+        query["modes"] = mode
+    doctors = (db.doctors.find(query, PUBLIC_DOCTOR_FIELDS)
+               .sort([("rating_count", DESCENDING), ("experience_years", DESCENDING), ("_id", 1)])
+               .skip(offset).limit(limit))
+    t = now()
+    cards = [doctor_card(d, next_available(db, d, t)) for d in doctors]
     # Doctors with an opening soonest first; those without hours go last.
-    cards.sort(key=lambda c: (c.next_available_at is None, c.next_available_at or now))
+    cards.sort(key=lambda c: (c.next_available_at is None, c.next_available_at or t))
     return cards
 
 
 @router.get("/doctors/{doctor_id}", response_model=DoctorCard)
-def doctor_profile(doctor_id: int, db: DB) -> DoctorCard:
-    d = db.get(Doctor, doctor_id)
-    if d is None or d.status != DoctorStatus.ACTIVE:
-        raise HTTPException(404, "Doctor not found")
+def doctor_profile(doctor_id: str, db: DB) -> DoctorCard:
+    d = _active_doctor(db, doctor_id)
     return doctor_card(d, next_available(db, d))
 
 
 @router.get("/doctors/{doctor_id}/slots", response_model=DaySlotsOut)
-def doctor_slots(doctor_id: int, db: DB, date_: date = Query(alias="date", description="IST date")) -> DaySlotsOut:
-    d = db.get(Doctor, doctor_id)
-    if d is None or d.status != DoctorStatus.ACTIVE:
-        raise HTTPException(404, "Doctor not found")
-    leave = leave_on(db, d.id, date_)
-    slots = day_slots(db, d, date_)
+def doctor_slots(doctor_id: str, db: DB, date_: date = Query(alias="date", description="IST date")) -> DaySlotsOut:
+    d = _active_doctor(db, doctor_id)
+    leave = leave_on(db, d["_id"], date_)
     return DaySlotsOut(
-        doctor_id=d.id,
+        doctor_id=str(d["_id"]),
         date=date_,
         day_off=leave is not None,
-        day_off_note=leave.note if leave else None,
+        day_off_note=leave.get("note") if leave else None,
         slots=[SlotOut(start_at=s.start_at, end_at=s.end_at, start_ist=ist_label(s.start_at), available=s.available)
-               for s in slots],
+               for s in day_slots(db, d, date_)],
     )
 
 
 # --- Book and track ---------------------------------------------------------------
 
-def _mine(db: DB, appointment_id: int, member: Member, lock: bool = False) -> Appointment:
-    q = select(Appointment).where(Appointment.id == appointment_id)
-    if lock:
-        q = q.with_for_update()
-    a = db.scalar(q)
-    if a is None or a.member_id != member.sub:
+def _mine(db: DB, appointment_id: str, member: Member) -> dict:
+    a = db.appointments.find_one({"_id": oid(appointment_id, "Appointment"), "member_id": member.sub})
+    if a is None:
         raise HTTPException(404, "Appointment not found")
     return a
 
@@ -106,66 +113,61 @@ def book(body: BookIn, db: DB, member: Member) -> BookingOut:
     """Holds the slot for a few minutes and returns a Razorpay order to pay.
     The booking is confirmed when Razorpay's webhook reports the payment."""
     a = appt_svc.create_hold(
-        db, doctor_id=body.doctor_id, member_id=member.sub, start_at=body.start_at,
+        db, doctor_id=oid(body.doctor_id, "Doctor"), member_id=member.sub, start_at=body.start_at,
         mode=body.mode, patient=body.patient.model_dump(),
     )
     out = appointment_out(a)
-    return BookingOut(**out.model_dump(), razorpay_key_id=get_settings().razorpay_key_id, amount_paise=a.fee_paise)
+    return BookingOut(**out.model_dump(), razorpay_key_id=get_settings().razorpay_key_id, amount_paise=a["fee_paise"])
 
 
 @router.get("/appointments", response_model=list[AppointmentOut])
 def my_appointments(
     db: DB, member: Member, scope: str = Query(default="all", pattern="^(upcoming|past|all)$")
 ) -> list[AppointmentOut]:
-    q = select(Appointment).where(
-        Appointment.member_id == member.sub, Appointment.status != AppointmentStatus.EXPIRED
-    )
-    now = datetime.now(UTC)
+    q: dict = {"member_id": member.sub, "status": {"$ne": AppointmentStatus.EXPIRED.value}}
+    t = now()
     if scope == "upcoming":
-        q = q.where(Appointment.end_at >= now).order_by(Appointment.start_at)
+        q["end_at"] = {"$gte": t}
+        sort = [("start_at", 1)]
     elif scope == "past":
-        q = q.where(Appointment.end_at < now).order_by(Appointment.start_at.desc())
+        q["end_at"] = {"$lt": t}
+        sort = [("start_at", DESCENDING)]
     else:
-        q = q.order_by(Appointment.start_at.desc())
-    return [appointment_out(a, now) for a in db.scalars(q.limit(200))]
+        sort = [("start_at", DESCENDING)]
+    return [appointment_out(a, t) for a in db.appointments.find(q).sort(sort).limit(200)]
 
 
 @router.get("/appointments/{appointment_id}", response_model=AppointmentOut)
-def get_appointment(appointment_id: int, db: DB, member: Member) -> AppointmentOut:
+def get_appointment(appointment_id: str, db: DB, member: Member) -> AppointmentOut:
     return appointment_out(_mine(db, appointment_id, member))
 
 
 @router.patch("/appointments/{appointment_id}/reschedule", response_model=AppointmentOut)
-def reschedule(appointment_id: int, body: RescheduleIn, db: DB, member: Member) -> AppointmentOut:
-    a = _mine(db, appointment_id, member, lock=True)
-    appt_svc.reschedule(db, a, body.start_at, member.sub)
-    db.commit()
-    return appointment_out(a)
+def reschedule(appointment_id: str, body: RescheduleIn, db: DB, member: Member) -> AppointmentOut:
+    a = _mine(db, appointment_id, member)
+    return appointment_out(appt_svc.reschedule(db, a, body.start_at, member.sub))
 
 
 @router.post("/appointments/{appointment_id}/cancel", response_model=AppointmentOut)
-def cancel(appointment_id: int, body: CancelIn, db: DB, member: Member) -> AppointmentOut:
+def cancel(appointment_id: str, body: CancelIn, db: DB, member: Member) -> AppointmentOut:
     """Full refund up to the cut-off before the consult; no refund after it."""
-    a = _mine(db, appointment_id, member, lock=True)
-    if a.status == AppointmentStatus.BOOKED and a.start_at <= datetime.now(UTC):
+    a = _mine(db, appointment_id, member)
+    if a["status"] == AppointmentStatus.BOOKED and a["start_at"] <= now():
         raise HTTPException(409, "The consult has already started")
     pct = appt_svc.member_cancel_refund_percent(a)
-    appt_svc.cancel(db, a, by="member", actor_id=member.sub, reason=body.reason, refund_percent=pct)
-    db.commit()
+    a = appt_svc.cancel(db, a, by="member", actor_id=member.sub, reason=body.reason, refund_percent=pct)
     return appointment_out(a)
 
 
 @router.post("/appointments/{appointment_id}/review", status_code=201)
-def review(appointment_id: int, body: ReviewIn, db: DB, member: Member) -> dict:
+def review(appointment_id: str, body: ReviewIn, db: DB, member: Member) -> dict:
     a = _mine(db, appointment_id, member)
-    if a.status != AppointmentStatus.COMPLETED:
+    if a["status"] != AppointmentStatus.COMPLETED:
         raise HTTPException(409, "You can review a consult once it's completed")
-    if db.scalar(select(Review.id).where(Review.appointment_id == a.id)):
+    try:
+        db.reviews.insert_one({"appointment_id": a["_id"], "doctor_id": a["doctor_id"], "member_id": member.sub,
+                               "rating": body.rating, "comment": body.comment, "created_at": now()})
+    except DuplicateKeyError:
         raise HTTPException(409, "You've already reviewed this consult")
-    db.add(Review(appointment_id=a.id, doctor_id=a.doctor_id, member_id=member.sub,
-                  rating=body.rating, comment=body.comment))
-    doctor = appt_svc.lock_doctor(db, a.doctor_id)
-    doctor.rating_sum += body.rating
-    doctor.rating_count += 1
-    db.commit()
+    db.doctors.update_one({"_id": a["doctor_id"]}, {"$inc": {"rating_sum": body.rating, "rating_count": 1}})
     return {"ok": True}
