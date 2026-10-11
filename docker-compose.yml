@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: suppai
+      POSTGRES_PASSWORD: suppai
+      POSTGRES_DB: suppai
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      SUPPAI_DATABASE_URL: postgresql+psycopg://suppai:suppai@db:5432/suppai
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports: ["8000:8000"]
+    depends_on: [db]
+    volumes: [storage:/app/storage]
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      SUPPAI_DATABASE_URL: postgresql+psycopg://suppai:suppai@db:5432/suppai
+    command: python -m app.worker
+    depends_on: [api]
+
+volumes:
+  pgdata:
+  storage:
