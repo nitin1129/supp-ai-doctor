@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 storage/
 .pytest_cache/
+.env.example
