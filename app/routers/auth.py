@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.db import now
 from app.deps import DB, client_ip
 from app.models import DoctorStatus
+from app.ratelimit import forgot_password_limit, limiter, login_limit
 from app.security import (
     create_access_token,
     hash_password,
@@ -63,7 +64,8 @@ def _doctor_active(db: DB, user: dict) -> bool:
 
 
 @router.post("/login", response_model=TokenOut)
-def login(body: LoginIn, db: DB) -> TokenOut:
+@limiter.limit(login_limit)
+def login(request: Request, body: LoginIn, db: DB) -> TokenOut:
     s = get_settings()
     ident = body.username.strip().lower()
     # Emails are stored lower-case; usernames are always lower-case.
@@ -119,7 +121,8 @@ def set_password(body: SetPasswordIn, db: DB) -> TokenOut:
 
 
 @router.post("/forgot-password", status_code=202)
-def forgot_password(body: ForgotIn, db: DB) -> dict:
+@limiter.limit(forgot_password_limit)
+def forgot_password(request: Request, body: ForgotIn, db: DB) -> dict:
     """Always answers 202 so the endpoint can't be used to find registered emails."""
     user = db.doctor_users.find_one({"email": body.email.lower()})
     if user is not None and _doctor_active(db, user):

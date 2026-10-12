@@ -1,5 +1,7 @@
 from bson import ObjectId
 
+from app.config import get_settings
+
 from tests.conftest import (
     ADMIN,
     MEMBER,
@@ -174,7 +176,9 @@ def test_weak_password_rejected(client, db):
     assert client.post("/auth/doctor/set-password", json={"token": tok, "password": "short"}).status_code == 422
 
 
-def test_login_locks_after_repeated_failures(client, db):
+def test_login_locks_after_repeated_failures(client, db, monkeypatch):
+    # Account lockout, not the per-IP limit, is under test here (that is in test_rate_limits.py).
+    monkeypatch.setattr(get_settings(), "rate_limit_login", "100/minute")
     onboard_doctor(client, db)
     for _ in range(5):
         assert client.post("/auth/doctor/login", json={"username": "dr.leela.menon", "password": "wrong"}).status_code == 401

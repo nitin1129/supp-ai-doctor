@@ -24,6 +24,9 @@ from app.main import app as fastapi_app  # noqa: E402
 from app.security import _VERHOEFF_D, _VERHOEFF_P, create_access_token  # noqa: E402
 from app.services.slots import today_ist  # noqa: E402
 import app.services.otp as _otp_mod  # noqa: E402
+from app.services import contacts as _contacts_mod  # noqa: E402
+from app.ratelimit import limiter as _limiter  # noqa: E402
+from app.services import payments as _payments_mod, payouts as _payouts_mod  # noqa: E402
 
 
 _captured: dict[str, list[str]] = {}
@@ -41,7 +44,11 @@ def _clean():
     for name in db.list_collection_names():
         db.drop_collection(name)
     ensure_indexes(db)
+    _contacts_mod.reset()
+    _limiter.reset()
+    _payments_mod._provider = _payouts_mod._provider = None  # fresh fakes per test
     yield
+    _contacts_mod.reset()
 
 
 @pytest.fixture(autouse=True)

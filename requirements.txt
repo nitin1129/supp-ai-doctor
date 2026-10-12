@@ -8,5 +8,6 @@ pyjwt>=2.9
 cryptography>=43
 python-multipart>=0.0.9
 httpx>=0.27
+slowapi>=0.1.9
 pytest>=8
 mongomock>=4.3  # in-memory MongoDB for tests

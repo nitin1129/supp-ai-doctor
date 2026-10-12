@@ -2,10 +2,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
+from slowapi.errors import RateLimitExceeded
 
 from app.config import get_settings
 from app.db import get_db
 from app.models import ensure_indexes
+from app.ratelimit import limiter, rate_limit_exceeded
 from app.routers import admin, applications, auth, doctor, member_auth, members, payments
 from app.services import storage
 
@@ -27,6 +29,8 @@ app = FastAPI(
     description="Doctor onboarding, doctor dashboard and member consult booking for suppai.in (MongoDB).",
     lifespan=lifespan,
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded)
 
 for r in (applications.router, admin.router, auth.router, doctor.router, member_auth.router, members.router, payments.router):
     app.include_router(r)

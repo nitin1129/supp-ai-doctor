@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     razorpay_webhook_secret: str = "dev-webhook-secret"
     payments_provider: str = "fake"  # "razorpay" in production
 
+    # Doctor payouts (RazorpayX uses the Razorpay key id/secret above)
+    payouts_provider: str = "fake"  # "razorpayx" in production
+    razorpayx_account_number: str = ""  # the RazorpayX business account payouts are sent from
+    razorpayx_payout_mode: str = "IMPS"  # IMPS | NEFT | RTGS
+
     # Video
     video_provider: str = "jitsi"
     jitsi_base_url: str = "https://meet.jit.si"
@@ -72,6 +77,16 @@ class Settings(BaseSettings):
     members_collection: str = "users"
     member_email_field: str = "email"
     member_name_field: str = "name"
+
+    # Member contact lookup for notifications: "memory" (dev/tests) or "platform"
+    member_contacts_provider: str = "memory"
+
+    # Rate limits per client IP (slowapi / limits syntax, e.g. "10/minute")
+    rate_limit_enabled: bool = True
+    rate_limit_storage_uri: str = "memory://"
+    rate_limit_applications: str = "10/minute"  # POST /doctors/applications and …/{id}/submit
+    rate_limit_login: str = "5/minute"  # POST /auth/doctor/login
+    rate_limit_forgot_password: str = "5/minute"  # POST /auth/doctor/forgot-password
 
     @property
     def tz(self) -> ZoneInfo:

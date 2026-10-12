@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from app.db import now, oid
 from app.deps import DB, client_ip
 from app.models import ApplicationStatus
+from app.ratelimit import applications_limit, limiter
 from app.schemas.applications import (
     DOCUMENT_KINDS,
     ApplicationCreated,
@@ -55,7 +56,8 @@ def _save(db: DB, app: dict, changes: dict) -> None:
 
 
 @router.post("", response_model=ApplicationCreated, status_code=201)
-def create_application(db: DB, body: ApplicationUpdate | None = None) -> ApplicationCreated:
+@limiter.limit(applications_limit)
+def create_application(request: Request, db: DB, body: ApplicationUpdate | None = None) -> ApplicationCreated:
     """Start a draft. Any steps already filled in can be sent now."""
     token = new_token()
     app = new_application(token)
@@ -165,7 +167,8 @@ def verify_email(application_id: str, body: EmailVerifyIn, db: DB, token: Token,
 
 
 @router.post("/{application_id}/submit", response_model=ApplicationOut)
-def submit_application(application_id: str, db: DB, token: Token) -> ApplicationOut:
+@limiter.limit(applications_limit)
+def submit_application(request: Request, application_id: str, db: DB, token: Token) -> ApplicationOut:
     """Submit (or resubmit after a hold). Keeps the same SA-DOC reference."""
     app = _load(db, application_id, token)
     if app["status"] not in EDITABLE:

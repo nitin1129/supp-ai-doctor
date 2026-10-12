@@ -142,6 +142,6 @@ These fill gaps in the v1 doc. All the numbers are settings in `.env`.
 ## Not built yet
 
 - E-prescriptions and consultation notes (expected by the Telemedicine Practice Guidelines 2020) and patient consent capture before the consult.
-- Payout execution (RazorpayX). Payouts are queued in `payouts` with status `queued`.
-- Real email, SMS and WhatsApp senders, and member contact lookup (see `deliver_message`).
-- Rate limiting on the public application and login endpoints. Put it at the gateway or add slowapi.
+- RazorpayX payout webhooks. The worker sends queued payouts (`queued → sending → sent | failed`, one idempotency key per payout; `SUPPAI_PAYOUTS_PROVIDER=razorpayx`), but final settlement (`payout.processed` / `reversed`) is not tracked yet. The RazorpayX adapter has not been run against the live API.
+- Real email, SMS and WhatsApp senders, and the production member contact source (`PlatformContactSource` in `app/services/contacts.py`; dev/tests use the in-memory source).
+- Rate limits (slowapi, per client IP) are on application create/submit, doctor login and forgot-password; settings `SUPPAI_RATE_LIMIT_*`. Counters are per process unless `SUPPAI_RATE_LIMIT_STORAGE_URI` points at a shared store.
