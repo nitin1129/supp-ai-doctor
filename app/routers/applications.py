@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Annotated
 
 from bson import ObjectId
-from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile, status
+from pydantic import BaseModel
 
 from app.db import now, oid
-from app.deps import DB
+from app.deps import DB, client_ip
 from app.models import ApplicationStatus
 from app.schemas.applications import (
     DOCUMENT_KINDS,
@@ -21,7 +22,7 @@ from app.schemas.applications import (
     DocumentOut,
 )
 from app.security import hash_token, new_token
-from app.services import storage
+from app.services import otp, storage
 from app.services.applications import (
     EDITABLE,
     apply_update,
@@ -122,6 +123,45 @@ def delete_document(application_id: str, document_id: str, db: DB, token: Token)
     )
     if res.modified_count == 0:
         raise HTTPException(404, "Document not found")
+
+
+class EmailVerifyIn(BaseModel):
+    code: str
+
+
+@router.post("/{application_id}/email/send-code", status_code=202)
+def send_email_code(application_id: str, db: DB, token: Token, request: Request) -> dict:
+    """Send an OTP to the email on the application to prove ownership."""
+    app = _load(db, application_id, token)
+    email = app.get("email")
+    if not email:
+        raise HTTPException(422, "Add your email address before requesting a code")
+    if app["status"] not in EDITABLE:
+        raise HTTPException(409, "Application can no longer be edited")
+    if app.get("email_verified_at"):
+        return {"message": "Email already verified", "email": email}
+    ip = client_ip(request)
+    otp.issue(db, email, "doctor_application", ip, context={"application_id": str(app["_id"])})
+    return {"message": "Code sent to your email address", "email": email}
+
+
+@router.post("/{application_id}/email/verify", response_model=ApplicationOut)
+def verify_email(application_id: str, body: EmailVerifyIn, db: DB, token: Token, request: Request) -> ApplicationOut:
+    """Verify the OTP and mark the application email as confirmed."""
+    app = _load(db, application_id, token)
+    email = app.get("email")
+    if not email:
+        raise HTTPException(422, "Add your email address before verifying")
+    ip = client_ip(request)
+    record = otp.verify(db, email, "doctor_application", body.code, ip)
+    ctx = record.get("context") or {}
+    if str(ctx.get("application_id", "")) != str(app["_id"]):
+        raise HTTPException(400, "The code is wrong or has expired. Request a new one if needed.")
+    t = now()
+    changes = {"email_verified_at": t, "verified_email": email}
+    _save(db, app, changes)
+    app.update(changes)
+    return to_out(app)
 
 
 @router.post("/{application_id}/submit", response_model=ApplicationOut)

@@ -1,12 +1,12 @@
 from datetime import timedelta
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, EmailStr
 from pymongo import ReturnDocument
 
 from app.config import get_settings
 from app.db import now
-from app.deps import DB
+from app.deps import DB, client_ip
 from app.models import DoctorStatus
 from app.security import (
     create_access_token,
@@ -15,6 +15,7 @@ from app.security import (
     validate_password_strength,
     verify_password,
 )
+from app.services import otp
 from app.services.applications import issue_set_password_link
 from app.services.audit import audit
 
@@ -124,4 +125,41 @@ def forgot_password(body: ForgotIn, db: DB) -> dict:
     if user is not None and _doctor_active(db, user):
         issue_set_password_link(db, user, template="doctor_password_reset")
     return {"message": "If that email is registered, a reset link is on its way."}
+
+
+class OtpRequestIn(BaseModel):
+    email: EmailStr
+
+
+class OtpVerifyIn(BaseModel):
+    email: EmailStr
+    code: str
+
+
+@router.post("/otp/request", status_code=202)
+def otp_request(body: OtpRequestIn, db: DB, request: Request) -> dict:
+    """Send a sign-in code. Always 202 — reveals nothing about registered emails."""
+    email = body.email.strip().lower()
+    ip = client_ip(request)
+    user = db.doctor_users.find_one({"email": email})
+    send = user is not None and _doctor_active(db, user)
+    otp.issue(db, email, "doctor_login", ip, send=send)
+    return {"message": "If that email is registered and your account is active, a sign-in code is on its way."}
+
+
+@router.post("/otp/verify", response_model=TokenOut)
+def otp_verify(body: OtpVerifyIn, db: DB, request: Request) -> TokenOut:
+    """Exchange a sign-in code for a bearer token."""
+    email = body.email.strip().lower()
+    ip = client_ip(request)
+    otp.verify(db, email, "doctor_login", body.code, ip)
+    user = db.doctor_users.find_one({"email": email})
+    if user is None or not _doctor_active(db, user):
+        raise HTTPException(400, "The code is wrong or has expired. Request a new one if needed.")
+    t = now()
+    db.doctor_users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"failed_logins": 0, "locked_until": None, "last_login_at": t}},
+    )
+    return _token_for(user)
 

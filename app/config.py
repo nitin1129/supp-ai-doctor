@@ -55,6 +55,24 @@ class Settings(BaseSettings):
     video_provider: str = "jitsi"
     jitsi_base_url: str = "https://meet.jit.si"
 
+    # Email
+    email_provider: str = "log"  # "log" or "brevo"
+    brevo_api_key: str = ""
+    email_from: str = "no-reply@suppai.in"
+    email_from_name: str = "SuppAI"
+
+    # OTP
+    otp_ttl_minutes: int = 10
+    otp_max_attempts: int = 5
+    otp_resend_seconds: int = 60
+    otp_max_per_email_hour: int = 5
+    otp_max_per_ip_hour: int = 20
+    otp_max_verify_per_ip_15min: int = 10
+    member_otp_signup: bool = True
+    members_collection: str = "users"
+    member_email_field: str = "email"
+    member_name_field: str = "name"
+
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)

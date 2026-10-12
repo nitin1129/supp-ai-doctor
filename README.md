@@ -47,6 +47,8 @@ SUPPAI_MONGO_URL=mongodb://localhost:27017 pytest   # against a real MongoDB (us
 | `POST /doctors/applications` | Start a draft; returns `resume_token` once |
 | `GET · PATCH /doctors/applications/{id}` | Resume / save a step (`X-Application-Token` header) |
 | `POST · DELETE /doctors/applications/{id}/documents` | Upload or remove a document (PDF/JPEG/PNG, 10 MB) |
+| `POST /doctors/applications/{id}/email/send-code` | Send a 6-digit OTP to the application email |
+| `POST /doctors/applications/{id}/email/verify` | Verify the OTP (`{"code": "123456"}`); required before submit |
 | `POST /doctors/applications/{id}/submit` | Submit or resubmit after a hold; lists anything missing |
 | **Admin → Onboarding → Doctors** | |
 | `GET /admin/doctors/applications?status=&q=` | List and search applications |
@@ -62,6 +64,11 @@ SUPPAI_MONGO_URL=mongodb://localhost:27017 pytest   # against a real MongoDB (us
 | `POST /auth/doctor/login` | Username or email + password; locks for 15 min after 5 failures |
 | `POST /auth/doctor/set-password` | From the invite or reset link (24 h, single use) |
 | `POST /auth/doctor/forgot-password` | Always 202 |
+| `POST /auth/doctor/otp/request` | Send a sign-in code; always 202 (no email enumeration) |
+| `POST /auth/doctor/otp/verify` | Exchange code `{"email","code"}` → bearer token |
+| **Member auth** | |
+| `POST /auth/member/otp/request` | Send a sign-in / sign-up code; always 202 |
+| `POST /auth/member/otp/verify` | Exchange code `{"email","code","name?"}` → member bearer token; creates account if `MEMBER_OTP_SIGNUP=true` |
 | **Doctor dashboard** (`/doctor`) | |
 | `GET · PUT /doctor/me` | Profile; fee and specialty changes go to admin |
 | `GET · PUT /doctor/hours` | Weekly windows (several per day), slot length, notice |
@@ -89,6 +96,8 @@ SUPPAI_MONGO_URL=mongodb://localhost:27017 pytest   # against a real MongoDB (us
 | `appointments` | Bookings, with a doctor snapshot in `doctor` and the timeline embedded in `events`. |
 | `payouts`, `reviews`, `profile_change_requests` | One payout and one review per appointment (unique indexes). |
 | `payment_webhook_events`, `audit_log`, `outbox`, `counters` | Webhook idempotency, admin audit, notification queue, SA-DOC numbering. |
+| `otp_codes` | 6-digit HMAC-SHA256 hashed codes (plain code never stored); TTL 1 h. |
+| `otp_verify_attempts` | Per-IP verify attempt counters; TTL 1 h. |
 
 Consistency without transactions:
 - Every status change is a conditional update on the current status (`find_one_and_update({_id, status: …})`), so two requests can't both move the same record.
@@ -116,6 +125,8 @@ Consistency without transactions:
 
 These fill gaps in the v1 doc. All the numbers are settings in `.env`.
 
+- **Email OTP.** Set `SUPPAI_EMAIL_PROVIDER=brevo` and `SUPPAI_BREVO_API_KEY=…` for production. In dev (`log`, the default) every OTP is printed to the server log — grep for `"is your SuppAI code"` or just watch the terminal. OTP rules: 6 digits, 10-minute TTL, 5 max attempts (code is then burned), 1 resend per 60 s per email+purpose, 5 per email per hour, 20 per IP per hour, 10 verify attempts per IP per 15 min.
+- **Application email must be verified before submit.** `POST …/email/send-code` then `POST …/email/verify`. If the email is later changed in a PATCH, verification resets.
 - **No passwords are shown or emailed.** Accept emails a single-use, 24 h set-password link. The "temporary password" panel in the admin UI should show the username and invite status instead.
 - **Usernames** are `dr.first.last`. If that's taken, a number is added (`dr.leela.menon2`).
 - **Aadhaar** is checksum-validated, then only the last 4 digits are kept. PAN and bank account are Fernet-encrypted at rest. The admin sees the full PAN, and each view is audited.

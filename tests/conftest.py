@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import tempfile
 from datetime import timedelta
@@ -22,6 +23,10 @@ from app.models import ensure_indexes  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.security import _VERHOEFF_D, _VERHOEFF_P, create_access_token  # noqa: E402
 from app.services.slots import today_ist  # noqa: E402
+import app.services.otp as _otp_mod  # noqa: E402
+
+
+_captured: dict[str, list[str]] = {}
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -36,6 +41,19 @@ def _clean():
     for name in db.list_collection_names():
         db.drop_collection(name)
     ensure_indexes(db)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _mock_otp_deliver(monkeypatch):
+    _captured.clear()
+
+    def _fake_deliver(to: str, subject: str, text: str) -> None:
+        m = re.match(r"^(\d{6})", subject)
+        if m:
+            _captured.setdefault(to.strip().lower(), []).append(m.group(1))
+
+    monkeypatch.setattr(_otp_mod, "_deliver", _fake_deliver)
     yield
 
 
@@ -106,12 +124,37 @@ def latest_link_token(db, email: str) -> str:
     return row["payload"]["link"].split("token=")[1]
 
 
+def last_code(email: str) -> str:
+    codes = _captured.get(email.strip().lower(), [])
+    assert codes, f"No OTP captured for {email!r}"
+    return codes[-1]
+
+
+def codes_sent_to(email: str) -> list[str]:
+    return list(_captured.get(email.strip().lower(), []))
+
+
+def verify_application_email(client, app_id: str, token: str, email: str) -> None:
+    r = client.post(
+        f"/doctors/applications/{app_id}/email/send-code",
+        headers={"X-Application-Token": token},
+    )
+    assert r.status_code == 202, r.text
+    r = client.post(
+        f"/doctors/applications/{app_id}/email/verify",
+        headers={"X-Application-Token": token},
+        json={"code": last_code(email)},
+    )
+    assert r.status_code == 200, r.text
+
+
 def onboard_doctor(client, db, name="Dr. Leela Menon", email="leela.menon@gmail.com", modes=("video",),
                    password="Maple2891secure") -> dict:
     """Applies, accepts, sets password, logs in, sets hours. Returns ids and headers."""
     r = client.post("/doctors/applications", json=full_application(name, email, modes))
     app_id, token = r.json()["id"], r.json()["resume_token"]
     upload_docs(client, app_id, token)
+    verify_application_email(client, app_id, token, email)
     assert client.post(f"/doctors/applications/{app_id}/submit", headers={"X-Application-Token": token}).status_code == 200
     r = client.post(f"/admin/doctors/applications/{app_id}/accept", headers=ADMIN, json={"registration_verified": True})
     assert r.status_code == 200, r.text

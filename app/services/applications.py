@@ -59,6 +59,8 @@ def new_application(token: str) -> dict:
         "reviewed_at": None,
         "reviewed_by": None,
         "doctor_id": None,
+        "email_verified_at": None,
+        "verified_email": None,
         "created_at": t,
         "updated_at": t,
     }
@@ -94,6 +96,10 @@ def apply_update(app: dict, body: ApplicationUpdate) -> dict:
     changes["full_name"] = personal.get("full_name", app.get("full_name"))
     changes["email"] = (personal.get("email") or app.get("email") or "").lower() or None
     changes["mobile"] = personal.get("mobile", app.get("mobile"))
+    # Clear email verification when the email changes from the verified value
+    if changes["email"] != app.get("verified_email"):
+        changes["email_verified_at"] = None
+        changes["verified_email"] = None
     if body.step:
         changes["current_step"] = max(app.get("current_step", 1), body.step)
     changes["updated_at"] = now()
@@ -123,6 +129,8 @@ def missing_items(app: dict) -> list[str]:
                 missing.append(f"teleconsult.{f}")
     have = {d["kind"] for d in app.get("documents", [])}
     missing += [f"documents.{k}" for k in REQUIRED_DOCUMENTS if k not in have]
+    if not app.get("email_verified_at"):
+        missing.append("personal.email_verified")
     return missing
 
 
@@ -153,6 +161,7 @@ def to_out(app: dict) -> ApplicationOut:
         submitted_at=app.get("submitted_at"),
         documents=[document_out(d) for d in app.get("documents", [])],
         missing=missing_items(app) if app["status"] in EDITABLE else [],
+        email_verified=bool(app.get("email_verified_at")),
     )
 
 

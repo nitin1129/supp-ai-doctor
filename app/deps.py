@@ -12,7 +12,7 @@ from typing import Annotated
 import jwt
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pymongo.database import Database
 
@@ -78,3 +78,7 @@ def require_doctor(db: DB, p: Principal = Depends(_principal)) -> dict:
 Admin = Annotated[Principal, Depends(require_admin)]
 Member = Annotated[Principal, Depends(require_member)]
 CurrentDoctor = Annotated[dict, Depends(require_doctor)]
+
+
+def client_ip(request: Request) -> str:
+    return request.client.host

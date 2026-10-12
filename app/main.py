@@ -6,7 +6,7 @@ from fastapi.responses import Response
 from app.config import get_settings
 from app.db import get_db
 from app.models import ensure_indexes
-from app.routers import admin, applications, auth, doctor, members, payments
+from app.routers import admin, applications, auth, doctor, member_auth, members, payments
 from app.services import storage
 
 _s = get_settings()
@@ -28,7 +28,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-for r in (applications.router, admin.router, auth.router, doctor.router, members.router, payments.router):
+for r in (applications.router, admin.router, auth.router, doctor.router, member_auth.router, members.router, payments.router):
     app.include_router(r)
 
 

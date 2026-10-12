@@ -9,6 +9,7 @@ from tests.conftest import (
     latest_link_token,
     onboard_doctor,
     upload_docs,
+    verify_application_email,
 )
 
 
@@ -61,6 +62,7 @@ def test_submit_requires_everything(client):
     assert r.status_code == 422
     assert "documents.registration_certificate" in r.json()["detail"]["missing"]
     upload_docs(client, app_id, tok["X-Application-Token"])
+    verify_application_email(client, app_id, tok["X-Application-Token"], full_application()["personal"]["email"])
     r = client.post(f"/doctors/applications/{app_id}/submit", headers=tok)
     assert r.status_code == 200
     assert r.json()["status"] == "submitted"
@@ -80,6 +82,7 @@ def test_clinic_mode_needs_clinic_address(client):
 def _submitted(client):
     app_id, tok = _draft(client, full_application())
     upload_docs(client, app_id, tok["X-Application-Token"])
+    verify_application_email(client, app_id, tok["X-Application-Token"], full_application()["personal"]["email"])
     client.post(f"/doctors/applications/{app_id}/submit", headers=tok)
     return app_id, tok
 

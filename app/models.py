@@ -111,6 +111,8 @@ def ensure_indexes(db: Database) -> None:
             spec = dict(idx.document)
             keys = list(spec.pop("key").items())
             db[name].create_index(keys, **spec)
+    from app.services.otp import ensure_indexes as _otp_indexes
+    _otp_indexes(db)
 
 
 if __name__ == "__main__":

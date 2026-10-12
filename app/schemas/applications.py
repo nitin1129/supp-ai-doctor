@@ -137,6 +137,7 @@ class ApplicationOut(BaseModel):
     submitted_at: datetime | None
     documents: list[DocumentOut]
     missing: list[str] = []
+    email_verified: bool = False
 
 
 class ApplicationCreated(ApplicationOut):
